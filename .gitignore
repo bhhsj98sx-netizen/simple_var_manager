@@ -1,0 +1,14 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+build/
+dist/
+*.spec
+
+previews/
+scene_cache.json
+supporters_cache*.json
+launcher_config.json
+_vam_temp_manifest.json
