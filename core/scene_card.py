@@ -10,6 +10,8 @@ class SceneCard(QWidget):
     def __init__(self, scene_name: str, var_name: str, image_bytes: bytes | None):
         super().__init__()
 
+        self.preview_rel = ""
+        self.preview_loaded = False
         self.scene_name = scene_name
         self.var_name = var_name
 
@@ -41,10 +43,7 @@ class SceneCard(QWidget):
         self.image_label.setStyleSheet("border: 1px solid #444; background-color: #222;")
 
         if image_bytes:
-            pixmap = QPixmap()
-            pixmap.loadFromData(image_bytes)
-            pixmap = pixmap.scaled(200, 130, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self.image_label.setPixmap(pixmap)
+            self.set_preview_image_bytes(image_bytes)
         else:
             self.image_label.setText("No Preview")
 
@@ -69,6 +68,27 @@ class SceneCard(QWidget):
         if event.button() == Qt.LeftButton:
             self.clicked.emit(self.scene_name, self.var_name)
         super().mousePressEvent(event)
+
+    # ------------------
+    # Preview API (NEW)
+    # ------------------
+    def set_preview_image_bytes(self, image_bytes: bytes | None):
+        """
+        Set / update preview image from raw bytes.
+        Keeps the same scaling behavior as __init__.
+        """
+        if not image_bytes:
+            # optional: keep current pixmap, or show placeholder
+            return
+
+        pix = QPixmap()
+        if not pix.loadFromData(image_bytes):
+            return
+
+        pix = pix.scaled(200, 130, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.image_label.setText("")
+        self.image_label.setPixmap(pix)
+        self.preview_loaded = True
 
     # ------------------
     # API used by GUI

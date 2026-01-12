@@ -6,6 +6,8 @@ import zipfile
 import time
 import hashlib
 import urllib.request
+import re
+import tempfile
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -13,15 +15,38 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QFileDialog, QProgressBar, QMessageBox,
     QScrollArea, QGridLayout, QLineEdit,
     QHBoxLayout, QFrame, QCheckBox, QDialog, QTextEdit, QComboBox, QTextBrowser,
-    QSpacerItem, QSizePolicy
+    QSpacerItem, QSizePolicy, QInputDialog
 )
 from PySide6.QtCore import QThread, Signal, Qt, QTimer, QEvent, QSize
-from PySide6.QtGui import QIcon, QDesktopServices
+from PySide6.QtGui import QIcon, QDesktopServices, QPalette
+
 from PySide6.QtCore import QUrl
 
 from core.resolver import resolve_dependency, is_asset_var
 from core.scanner import scan_var
 from core.scene_card import SceneCard
+
+def resource_path(rel_path: str) -> Path:
+    """
+    Get absolute path to resource, works for dev and for PyInstaller --onefile
+    """
+    if hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS) / rel_path
+    return Path(rel_path)
+
+
+
+# ======================
+# App version + Updater (GitHub Releases)
+# ======================
+APP_VERSION = "1.1.0"
+
+GITHUB_OWNER = "bhhsj98sx-netizen"
+GITHUB_REPO = "simple_var_manager"
+GITHUB_LATEST_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+
+RELEASE_ASSET_NAME = "VaM.Simple.Var.Manager.exe"
+UPDATER_EXE_NAME = "updater.exe"
 
 
 # ======================
@@ -69,7 +94,7 @@ When you close <b>VaM.exe</b>, all renamed files will automatically restore back
     <ul>
       <li>
         <b>Choose which scenes you want to play</b><br>
-        All unrelated .var files to that scenes will be temporarily disabled.
+        All unrelated .var files to those scenes will be temporarily disabled.
       </li>
       <li>
         <b>Select nothing</b><br>
@@ -84,10 +109,47 @@ When you close <b>VaM.exe</b>, all renamed files will automatically restore back
   </li>
 
   <li>
+    <b>Live mode (NEW)</b><br>
+    While VaM is running, you can change selection and click <b>Update Scene Selection</b>.<br>
+    Then in VaM, use its refresh / rescan packages button to update the package list.
+  </li>
+
+  <li>
     <b>No extra steps needed</b><br>
     When you close <b>VaM.exe</b>, all renamed .var files will automatically return to normal.
   </li>
 </ol>
+
+<hr>
+
+<h3>Buttons Explanation</h3>
+
+<ul>
+  <li>
+    <b>Refresh</b><br>
+    Re-checks the current VaM folder for changes (new / removed / modified .var files or scenes).<br>
+    Use this if you manually add, remove, or edit files while the app is open.
+  </li>
+
+  <li>
+    <b>Restore VARs Manually</b><br>
+    Immediately restores all previously disabled <b>.var.disabled</b> files back to normal.<br>
+    Use this if:
+    <ul>
+      <li>VaM crashed</li>
+      <li>You closed the app unexpectedly</li>
+      <li>You want to cancel a lean session manually</li>
+    </ul>
+  </li>
+
+  <li>
+    <b>Update Scene Selection</b><br>
+    Applies your current scene selection <b>while VaM is already running</b>.<br>
+    This allows you to enable or disable .var files without restarting VaM.<br><br>
+    After clicking this button, you may need to use VaM’s
+    <b>refresh / rescan packages</b> button inside the game.
+  </li>
+</ul>
 
 <hr>
 
@@ -97,16 +159,8 @@ You can save and load your scene selections as presets, so you don’t need to
 select them again next time.
 </p>
 
-<hr>
-
-<h3>Notes</h3>
-<p>
-This app continue to improving.
-More features will be added over time, but the goal is to
-<b>keep it simple and easy to use</b>.
-</p>
-
 <p><b>Enjoy! ^^</b></p>
+
 """
 
 
@@ -189,7 +243,7 @@ def load_supporters_cached(max_age_hours: float = 2.0) -> dict:
     try:
         req = urllib.request.Request(
             SUPPORTERS_URL,
-            headers={"User-Agent": "VSVM/1.0"}
+            headers={"User-Agent": f"VSVM/{APP_VERSION}"}
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = resp.read().decode("utf-8", errors="ignore")
@@ -324,13 +378,13 @@ def _should_count_loose_scene(relp: str) -> bool:
     name = Path(rp).name.lower()
     stem = Path(rp).stem
 
-    # skip noisy/unknown files like VaM does
     if name == "default.json":
         return False
     if stem.isdigit():
         return False
 
     return True
+
 
 
 # ======================
@@ -346,7 +400,7 @@ def manifest_path_for(vam_dir: Path) -> Path:
 
 
 # ======================
-# Loading popup (animated dots + indeterminate bar)
+# Loading popup
 # ======================
 class LoadingPopup(QDialog):
     def __init__(self, parent=None):
@@ -389,7 +443,7 @@ class LoadingPopup(QDialog):
         lay.addWidget(self.sub)
 
         self.bar = QProgressBar()
-        self.bar.setRange(0, 0)  # indeterminate
+        self.bar.setRange(0, 0)
         self.bar.setMinimumHeight(16)
         self.bar.setTextVisible(False)
         self.bar.setStyleSheet("""
@@ -458,7 +512,7 @@ class HelpDialog(QDialog):
 
 
 # ======================
-# Donation dialog (Supporters + Patreon link)
+# Donation dialog
 # ======================
 class DonationDialog(QDialog):
     PATREON_URL = "https://www.patreon.com/c/LQuest"
@@ -555,7 +609,7 @@ class WelcomeDialog(QDialog):
 
 
 # ======================
-# Worker Thread (VaM-like by default)
+# Worker Thread (scan)
 # ======================
 class AnalyzeWorker(QThread):
     finished = Signal(object, int, dict)  # scene_entries, total_var_count, cache_obj
@@ -688,7 +742,7 @@ class AnalyzeWorker(QThread):
 
 
 # ======================
-# Lightweight change-check worker
+# ChangeCheckWorker
 # ======================
 class ChangeCheckWorker(QThread):
     finished = Signal(bool)  # needs_rescan?
@@ -763,7 +817,7 @@ class ChangeCheckWorker(QThread):
 
 
 # ======================
-# Looks detector worker (ONLY when checkbox ticked)
+# LooksWorker
 # ======================
 class LooksWorker(QThread):
     finished = Signal(dict)  # looks_map { "var::scene": bool }
@@ -781,6 +835,13 @@ class LooksWorker(QThread):
     @staticmethod
     def _detect_looks_in_var(var_path: Path, scene_name: str) -> bool:
         wanted = f"{scene_name}.json".lower()
+
+        # NEW: fallback to .disabled
+        if not var_path.exists():
+            alt = Path(str(var_path) + DISABLED_SUFFIX)
+            if alt.exists():
+                var_path = alt
+
         try:
             with zipfile.ZipFile(var_path, "r") as z:
                 target = None
@@ -801,6 +862,7 @@ class LooksWorker(QThread):
                 return ("/female" in txt) and ("/male" not in txt)
         except Exception:
             return False
+
 
     def run(self):
         out = dict(self.existing) if isinstance(self.existing, dict) else {}
@@ -846,14 +908,126 @@ class DependencyRow(QWidget):
 # ======================
 # Main GUI
 # ======================
+def is_dark_mode(app: QApplication) -> bool:
+    pal = app.palette()
+    # value 0-255, makin kecil makin gelap
+    win = pal.color(QPalette.Window).value()
+    txt = pal.color(QPalette.WindowText).value()
+    # kalau background gelap dan text terang -> dark mode
+    return win < 128 and txt > 128
+
+def build_btn_css(dark: bool) -> str:
+    if not dark:
+        # LIGHT MODE → respect system palette, only sizing + disabled clarity
+        return """
+        QPushButton, QComboBox {
+            min-height: 26px;
+            padding: 6px 14px;
+            font-size: 12px;
+        }
+
+        QPushButton:disabled, QComboBox:disabled {
+            color: #666;
+            background-color: #f0f0f0;
+            border: 1px solid #cfcfcf;
+        }
+        """
+    else:
+        # DARK MODE → custom visual styling
+        return """
+        QPushButton, QComboBox {
+            min-height: 26px;
+            padding: 6px 14px;
+            font-size: 12px;
+
+            background-color: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.18);
+            border-radius: 8px;
+            color: #eee;
+        }
+
+        QPushButton:hover, QComboBox:hover {
+            background-color: rgba(255,255,255,0.14);
+            border: 1px solid rgba(255,255,255,0.28);
+        }
+
+        QPushButton:pressed {
+            background-color: rgba(255,255,255,0.18);
+        }
+
+        QPushButton:disabled, QComboBox:disabled {
+            background-color: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.08);
+            color: #777;
+        }
+        """
+
+def build_scrollbar_css(dark: bool) -> str:
+    if dark:
+        return """
+        QScrollBar:vertical {
+            width: 18px;
+            background: rgba(255,255,255,0.05);
+            margin: 4px 3px 4px 3px;
+            border-radius: 9px;
+        }
+        QScrollBar::handle:vertical {
+            background: rgba(255,255,255,0.40);
+            min-height: 48px;
+            border-radius: 9px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: rgba(255,255,255,0.60);
+        }
+        QScrollBar::add-line:vertical,
+        QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+        QScrollBar::add-page:vertical,
+        QScrollBar::sub-page:vertical {
+            background: none;
+        }
+        """
+    else:
+        return """
+        QScrollBar:vertical {
+            width: 18px;
+            background: rgba(0,0,0,0.06);
+            margin: 4px 3px 4px 3px;
+            border-radius: 9px;
+        }
+        QScrollBar::handle:vertical {
+            background: rgba(0,0,0,0.35);
+            min-height: 48px;
+            border-radius: 9px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: rgba(0,0,0,0.55);
+        }
+        QScrollBar::add-line:vertical,
+        QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+        QScrollBar::add-page:vertical,
+        QScrollBar::sub-page:vertical {
+            background: none;
+        }
+        """
+
+
+
+
 class MainWindow(QWidget):
+    def _set_dim_label(self, label: QLabel, dark_hex: str):
+        if self._dark:
+            label.setStyleSheet(f"color: {dark_hex};")
     def __init__(self):
         super().__init__()
 
         _ = app_data_dir()
         _ = previews_dir()
 
-        self.setWindowTitle("VaM Simple VAR Manager")
+        self.setWindowTitle("VaM Simple VAR Manager v1.1.0")
         self.resize(1220, 780)
 
         self.cfg = load_config()
@@ -872,6 +1046,24 @@ class MainWindow(QWidget):
         self.scene_entries: list[dict] = []
         self.total_scene_files_found = 0
 
+        #apply button variable
+        self.session_baseline_scene_vars: set[str] = set()
+        self.selection_dirty = False
+
+        self._apply_attention_timer = QTimer(self)
+        self._apply_attention_timer.setInterval(450)
+        self._apply_attention_timer.timeout.connect(self._tick_apply_attention)
+        self._apply_attention_on = False
+
+                # ---- selection dirty debounce (prevents UI freeze during batch/preset load)
+        self._dirty_check_timer = QTimer(self)
+        self._dirty_check_timer.setSingleShot(True)
+        self._dirty_check_timer.setInterval(150)
+        self._dirty_check_timer.timeout.connect(self._check_selection_dirty)
+
+
+
+        # lean session state
         self.lean_active = False
         self.vam_seen_running = False
 
@@ -884,39 +1076,24 @@ class MainWindow(QWidget):
         self._resize_timer.setInterval(100)
         self._resize_timer.timeout.connect(lambda: self.apply_filter(self.search.text()))
 
+                # drag-to-scroll (touch-like)
+        self._drag_scroll_active = False
+        self._drag_scroll_start_pos = None
+        self._drag_scroll_start_value = 0
+
+
         self._syncing_selection_ui = False
         self._batch_selection = False
 
         self.looks_map: dict[str, bool] = {}
 
-        # refresh / startup flags
         self._startup_in_progress = False
         self._refresh_in_progress = False
 
-        self._btn_css = """
-            QPushButton, QComboBox {
-                background-color: rgba(255,255,255,0.08);
-                border: 1px solid rgba(255,255,255,0.18);
-                border-radius: 8px;
-                padding: 6px 10px;
-                color: #eee;
-                min-height: 26px;
-            }
-            QPushButton:hover {
-                background-color: rgba(255,255,255,0.14);
-                border: 1px solid rgba(255,255,255,0.28);
-            }
-            QPushButton:pressed {
-                background-color: rgba(255,255,255,0.18);
-            }
-            QPushButton:disabled {
-                background-color: rgba(255,255,255,0.03);
-                border: 1px solid rgba(255,255,255,0.08);
-                color: #777;
-            }
-        """
+        self._dark = is_dark_mode(QApplication.instance())
+        self._btn_css = build_btn_css(self._dark)
 
-        # Loading popup
+
         self.loading = LoadingPopup(self)
 
         root = QHBoxLayout(self)
@@ -935,7 +1112,7 @@ class MainWindow(QWidget):
         row_head.addWidget(self.title, 1)
 
         self.btn_help = QPushButton("Help")
-        icon_path = Path("icons/qmark.png")
+        icon_path = resource_path("icons/qmark.png")
         if icon_path.exists():
             self.btn_help.setIcon(QIcon(str(icon_path)))
             self.btn_help.setIconSize(QSize(18, 18))
@@ -943,8 +1120,19 @@ class MainWindow(QWidget):
         self.btn_help.clicked.connect(self.open_help)
         row_head.addWidget(self.btn_help, 0, Qt.AlignRight)
 
+        # (You said you already moved Update beside Help earlier; keep it here.)
+        self.btn_check_update = QPushButton(" Update")
+        icon_path = resource_path("icons/update.png")
+        if icon_path.exists():
+            self.btn_check_update.setIcon(QIcon(str(icon_path)))
+            self.btn_check_update.setIconSize(QSize(18, 18))
+        self.btn_check_update.setToolTip("Check GitHub for a newer version and update.")
+        self.btn_check_update.setStyleSheet(self._btn_css)
+        self.btn_check_update.clicked.connect(self.check_update_clicked)
+        row_head.addWidget(self.btn_check_update, 0, Qt.AlignRight)
+
         self.btn_donate = QPushButton(" Support Me")
-        icon_path = Path("icons/donation.png")
+        icon_path = resource_path("icons/donation.png")
         if icon_path.exists():
             self.btn_donate.setIcon(QIcon(str(icon_path)))
             self.btn_donate.setIconSize(QSize(18, 18))
@@ -957,8 +1145,15 @@ class MainWindow(QWidget):
         self.status = QLabel("Starting...")
         self.left_layout.addWidget(self.status)
 
+
+        self.apply_row = QHBoxLayout()
+        self.apply_row.setSpacing(8)
+
+        self.left_layout.addLayout(self.apply_row)
+
         self.info_label = QLabel("Total VARs: - | Unused VARs: - | Scenes: -")
-        self.info_label.setStyleSheet("color: #aaa;")
+        self._set_dim_label(self.info_label, "#aaa")
+
         self.left_layout.addWidget(self.info_label)
 
         self.left_layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Fixed))
@@ -991,7 +1186,6 @@ class MainWindow(QWidget):
 
         row_top = QHBoxLayout()
 
-        # Renamed "Use Last Folder" -> "Refresh"
         self.btn_refresh = QPushButton("Refresh")
         self.btn_refresh.setToolTip("Check for changes in the current VaM folder and update if needed.")
         self.btn_refresh.setStyleSheet(self._btn_css)
@@ -1001,7 +1195,7 @@ class MainWindow(QWidget):
         self.btn_select = QPushButton("Select VaM Directory")
         self.btn_select.setStyleSheet(self._btn_css)
         self.btn_select.clicked.connect(self.select_folder)
-        icon_path = Path("icons/folder.png")
+        icon_path = resource_path("icons/folder.png")
         if icon_path.exists():
             self.btn_select.setIcon(QIcon(str(icon_path)))
             self.btn_select.setIconSize(QSize(18, 18))
@@ -1009,9 +1203,22 @@ class MainWindow(QWidget):
 
         ctl_left_lay.addLayout(row_top)
 
+        self.btn_restore = QPushButton("Restore VARs Manually")
+        self.btn_restore.setStyleSheet(self._btn_css)
+        self.btn_restore.setEnabled(False)
+        self.btn_restore.clicked.connect(self.restore_offloaded_vars)
+        row_top.addWidget(self.btn_restore, 1)
+        
+        self.btn_apply_now = QPushButton("Update Scene Selection")
+        self.btn_apply_now.setToolTip("Apply your current selection while VaM is running (VaM needs in-game refresh).")
+        self.btn_apply_now.setStyleSheet(self._btn_css)
+        self.btn_apply_now.setEnabled(False)
+        self.btn_apply_now.clicked.connect(self.apply_selection_now_clicked)
+        row_top.addWidget(self.btn_apply_now, 1)  
+
         row_launch = QHBoxLayout()
 
-        icon_path = Path("icons/playbtn.png")
+        icon_path = resource_path("icons/playbtn.png")
         icon_obj = QIcon(str(icon_path)) if icon_path.exists() else None
 
         self.btn_launch_vam = QPushButton("  Launch VaM.exe")
@@ -1022,6 +1229,15 @@ class MainWindow(QWidget):
         self.btn_launch_vam.clicked.connect(self.launch_vam_exe_lean)
         row_launch.addWidget(self.btn_launch_vam, 1)
 
+        self.btn_launch_vd = QPushButton("  Launch VaM (Virtual Desktop)")
+        if icon_obj:
+            self.btn_launch_vd.setIcon(icon_obj)
+            self.btn_launch_vd.setIconSize(QSize(13, 13))
+        self.btn_launch_vd.setStyleSheet(self._btn_css)
+        self.btn_launch_vd.clicked.connect(self.launch_vam_vd_lean)
+        row_launch.addWidget(self.btn_launch_vd, 1)
+
+
         self.btn_launch_launcher = QPushButton("  Launch VaM Launcher")
         if icon_obj:
             self.btn_launch_launcher.setIcon(icon_obj)
@@ -1030,11 +1246,9 @@ class MainWindow(QWidget):
         self.btn_launch_launcher.clicked.connect(self.launch_vam_launcher_lean)
         row_launch.addWidget(self.btn_launch_launcher, 1)
 
-        self.btn_restore = QPushButton("Restore VARs")
-        self.btn_restore.setStyleSheet(self._btn_css)
-        self.btn_restore.setEnabled(False)
-        self.btn_restore.clicked.connect(self.restore_offloaded_vars)
-        row_launch.addWidget(self.btn_restore, 1)
+        
+        
+      
 
         ctl_left_lay.addLayout(row_launch)
 
@@ -1054,13 +1268,10 @@ class MainWindow(QWidget):
         ctl_right_lay.addWidget(self.chk_select_mode, 0)
 
         row_preset = QHBoxLayout()
+        self.MAX_PRESETS = 5  
         self.preset_combo = QComboBox()
-        self.preset_combo.addItems([
-            "Scenes Selection Preset 1",
-            "Scenes Selection Preset 2",
-            "Scenes Selection Preset 3",
-            "Scenes Selection Preset 4",
-        ])
+        self.preset_combo.addItems([f"Scene Selection Preset {i}" for i in range(1, self.MAX_PRESETS + 1)])
+
         self.preset_combo.setMinimumHeight(30)
         row_preset.addWidget(self.preset_combo, 1)
 
@@ -1087,7 +1298,7 @@ class MainWindow(QWidget):
         self.left_layout.addItem(QSpacerItem(0, 20, QSizePolicy.Minimum, QSizePolicy.Fixed))
 
         self.selection_info = QLabel("Total Scene: 0 scenes | Selected Scene: 0 scenes")
-        self.selection_info.setStyleSheet("color: #aaa;")
+        self._set_dim_label(self.selection_info, "#aaa")
         self.left_layout.addWidget(self.selection_info)
 
         row_search = QHBoxLayout()
@@ -1134,6 +1345,8 @@ class MainWindow(QWidget):
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet(build_scrollbar_css(self._dark))
+
         self.scroll.viewport().installEventFilter(self)
 
         self.scene_container = QWidget()
@@ -1163,11 +1376,11 @@ class MainWindow(QWidget):
 
         self.dep_selected = QLabel('Click a card to see dependencies.\n(Selection mode: click selects)')
         self.dep_selected.setWordWrap(True)
-        self.dep_selected.setStyleSheet("color: #bbb;")
+        self._set_dim_label(self.dep_selected, "#bbb")
         self.right_layout.addWidget(self.dep_selected)
 
         self.dep_summary = QLabel("")
-        self.dep_summary.setStyleSheet("color: #aaa;")
+        self._set_dim_label(self.dep_summary, "#aaa")
         self.right_layout.addWidget(self.dep_summary)
 
         self.dep_scroll = QScrollArea()
@@ -1191,20 +1404,20 @@ class MainWindow(QWidget):
 
         self.refresh_refresh_button()
         self.refresh_restore_button()
+        self.refresh_apply_button()
         self.update_selection_ui()
 
-        self._maybe_show_welcome_once()
+        self.refresh_preset_combo_names()
 
-        # show loading popup immediately after window is shown
+        self._maybe_show_welcome_once()
         QTimer.singleShot(0, self._startup_sequence)
 
     # ======================
-    # Startup sequence with loading popup
+    # Startup sequence
     # ======================
     def _startup_sequence(self):
         self._startup_in_progress = True
         self.loading.start("Loading", "Preparing scenes...")
-        # start auto-open after popup is visible
         QTimer.singleShot(50, self.auto_open_last_folder_on_startup)
 
     def _end_busy(self):
@@ -1212,6 +1425,129 @@ class MainWindow(QWidget):
         self._startup_in_progress = False
         self._refresh_in_progress = False
         self.refresh_refresh_button()
+
+    def refresh_preset_combo_names(self):
+        current = self.preset_combo.currentIndex()
+        self.preset_combo.blockSignals(True)
+        try:
+            self.preset_combo.clear()
+            for i in range(1, self.MAX_PRESETS + 1):
+                self.preset_combo.addItem(self.get_preset_name(i))
+        finally:
+            self.preset_combo.blockSignals(False)
+        if 0 <= current < self.preset_combo.count():
+            self.preset_combo.setCurrentIndex(current)
+
+    #apply button styling
+
+    def _schedule_check_selection_dirty(self):
+        # coalesce many rapid changes into 1 expensive check + possible QSS pulse update
+        if self._dirty_check_timer.isActive():
+            return
+        self._dirty_check_timer.start()
+
+    def _begin_batch_selection(self):
+        self._batch_selection = True
+        self.scene_container.setUpdatesEnabled(False)
+
+    def _end_batch_selection(self):
+        self._batch_selection = False
+        self.scene_container.setUpdatesEnabled(True)
+        # do heavy UI only once
+        self.apply_filter(self.search.text())
+        self.update_selection_ui()
+        self._check_selection_dirty()
+
+
+    def _apply_btn_normal_style(self):
+        self.btn_apply_now.setStyleSheet(self._btn_css)
+
+    def _apply_btn_attention_style(self, phase: bool):
+        # phase True/False to “pulse”
+        if phase:
+            self.btn_apply_now.setStyleSheet(self._btn_css + """
+                QPushButton {
+                    border: 2px solid rgba(255, 215, 64, 0.95);
+                    background-color: rgba(255, 215, 64, 0.20);
+                    font-weight: 700;
+                }
+            """)
+        else:
+            self.btn_apply_now.setStyleSheet(self._btn_css + """
+                QPushButton {
+                    border: 2px solid rgba(255, 215, 64, 0.55);
+                    background-color: rgba(255, 215, 64, 0.10);
+                    font-weight: 700;
+                }
+            """)
+
+    def _tick_apply_attention(self):
+        self._apply_attention_on = not self._apply_attention_on
+        self._apply_btn_attention_style(self._apply_attention_on)
+
+    def set_apply_attention(self, on: bool):
+        # only show attention if button is enabled
+        if not self.btn_apply_now.isEnabled():
+            on = False
+
+        if on:
+            if not self._apply_attention_timer.isActive():
+                self._apply_attention_on = False
+                self._apply_attention_timer.start()
+        else:
+            if self._apply_attention_timer.isActive():
+                self._apply_attention_timer.stop()
+            self._apply_btn_normal_style()
+
+    
+    def _preset_key(self, idx: int) -> str:
+        return f"preset_{idx}"
+
+    def _preset_names_map(self) -> dict:
+        self.cfg.setdefault("preset_names", {})
+        if not isinstance(self.cfg["preset_names"], dict):
+            self.cfg["preset_names"] = {}
+        return self.cfg["preset_names"]
+
+    def _default_preset_name(self, idx: int) -> str:
+        return f"Scene Selection Preset {idx}"
+
+    def get_preset_name(self, idx: int) -> str:
+        names = self._preset_names_map()
+        name = names.get(self._preset_key(idx), "")
+        name = (name or "").strip()
+        return name if name else self._default_preset_name(idx)
+
+    def set_preset_name(self, idx: int, name: str):
+        names = self._preset_names_map()
+        clean = (name or "").strip()
+        if not clean:
+            clean = self._default_preset_name(idx)
+        names[self._preset_key(idx)] = clean
+        save_config(self.cfg)
+
+
+    def all_var_names_on_disk(self) -> set[str]:
+        """
+        Returns ALL var names that exist in AddonPackages, including disabled ones,
+        normalized to original name (Something.var).
+        """
+        if not self.addon_dir:
+            return set()
+
+        out: set[str] = set()
+
+        # enabled
+        for p in self.addon_dir.glob("*.var"):
+            out.add(p.name)
+
+        # disabled -> normalize back to .var
+        for p in self.addon_dir.glob("*.var.disabled"):
+            orig = p.name[:-len(DISABLED_SUFFIX)]
+            out.add(orig)
+
+        return out
+
 
     # ======================
     # One-time welcome
@@ -1225,7 +1561,7 @@ class MainWindow(QWidget):
         save_config(self.cfg)
 
     # ======================
-    # Donation window
+    # Donation
     # ======================
     def open_donation(self):
         DonationDialog(self).exec()
@@ -1239,13 +1575,44 @@ class MainWindow(QWidget):
     def save_preset(self):
         if not self.is_selection_mode():
             return
+
         idx = self.preset_combo.currentIndex() + 1
         key = self._preset_key(idx)
+
+        # default / current name
+        current_name = self.get_preset_name(idx)
+
+        name, ok = QInputDialog.getText(
+            self,
+            "Preset Name",
+            f"Enter name for Preset {idx}:",
+            QLineEdit.Normal,
+            current_name
+        )
+        if not ok:
+            return  # user cancelled
+
+        name = (name or "").strip()
+        if not name:
+            name = self._default_preset_name(idx)
+
+        # save selection
         self.cfg.setdefault("presets", {})
         self.cfg["presets"][key] = sorted(self.selected_scene_vars)
+
+        # save name
+        self.cfg.setdefault("preset_names", {})
+        self.cfg["preset_names"][key] = name
+
         self.cfg["last_preset"] = idx
         save_config(self.cfg)
-        QMessageBox.information(self, "Preset Saved", f"Saved current selection to Preset {idx}")
+
+        # update combo display
+        self.refresh_preset_combo_names()
+        self.preset_combo.setCurrentIndex(idx - 1)
+
+        QMessageBox.information(self, "Preset Saved", f'Saved selection to "{name}"')
+
 
     def load_preset(self):
         if not self.is_selection_mode():
@@ -1259,23 +1626,31 @@ class MainWindow(QWidget):
             QMessageBox.information(self, "Empty Preset", f"Preset {idx} is empty.\nSave a selection first.")
             return
 
-        self.selected_scene_vars = set(items)
+        new_set = set(items)
+        old_set = set(self.selected_scene_vars)
 
-        self._batch_selection = True
-        self.scene_container.setUpdatesEnabled(False)
+        to_turn_off = old_set - new_set
+        to_turn_on = new_set - old_set
+
+        self._begin_batch_selection()
         try:
-            for var_name in self.card_by_var.keys():
-                self._set_var_selected(var_name, var_name in self.selected_scene_vars)
+            # turn off removed
+            for var_name in to_turn_off:
+                self._set_var_selected(var_name, False)
+            # turn on added
+            for var_name in to_turn_on:
+                self._set_var_selected(var_name, True)
+
+            # update the internal set exactly
+            self.selected_scene_vars = new_set
         finally:
-            self._batch_selection = False
-            self.scene_container.setUpdatesEnabled(True)
+            self._end_batch_selection()
 
         self.cfg["last_preset"] = idx
         save_config(self.cfg)
 
-        self.apply_filter(self.search.text())
-        self.update_selection_ui()
         QMessageBox.information(self, "Preset Loaded", f"Loaded Preset {idx}")
+
 
     # ======================
     # Help
@@ -1286,10 +1661,50 @@ class MainWindow(QWidget):
     # ======================
     # UI helpers
     # ======================
+
+    
+
+    
     def eventFilter(self, obj, event):
-        if obj == self.scroll.viewport() and event.type() == QEvent.Resize:
-            self._resize_timer.start()
+        if obj == self.scroll.viewport():
+            et = event.type()
+
+            # keep your resize behavior
+            if et == QEvent.Resize:
+                self._resize_timer.start()
+                return False
+
+            # --- drag-to-scroll (like phone) ---
+            if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                # don't steal clicks from interactive widgets (cards/buttons etc.)
+                child = obj.childAt(event.pos())
+                if child and (isinstance(child, QPushButton) or isinstance(child, QCheckBox) or isinstance(child, QLineEdit) or isinstance(child, QComboBox)):
+                    return False
+
+                self._drag_scroll_active = True
+                self._drag_scroll_start_pos = event.globalPosition().toPoint()
+                self._drag_scroll_start_value = self.scroll.verticalScrollBar().value()
+                obj.setCursor(Qt.ClosedHandCursor)
+                event.accept()
+                return True
+
+            if et == QEvent.MouseMove and self._drag_scroll_active:
+                cur = event.globalPosition().toPoint()
+                dy = cur.y() - self._drag_scroll_start_pos.y()
+                # invert so drag down scrolls down (natural touch feel)
+                self.scroll.verticalScrollBar().setValue(self._drag_scroll_start_value - dy)
+                event.accept()
+                return True
+
+            if et in (QEvent.MouseButtonRelease, QEvent.Leave) and self._drag_scroll_active:
+                self._drag_scroll_active = False
+                self._drag_scroll_start_pos = None
+                obj.unsetCursor()
+                event.accept()
+                return True
+
         return super().eventFilter(obj, event)
+
 
     def _calc_max_cols(self) -> int:
         card_w = 220
@@ -1311,6 +1726,27 @@ class MainWindow(QWidget):
         if not self.vam_dir:
             return None
         return self.vam_dir / "VaM_Updater.exe"
+    
+    def find_running_vd_streamer_path(self) -> Path | None:
+        try:
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                "(Get-Process -Name 'VirtualDesktop.Streamer' -ErrorAction SilentlyContinue | "
+                "Select-Object -First 1 -ExpandProperty Path)"
+            ]
+            out = subprocess.check_output(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+            p = out.decode("utf-8", errors="ignore").strip().strip('"')
+            if not p:
+                return None
+            pp = Path(p)
+            return pp if pp.exists() and pp.is_file() else None
+        except Exception:
+            return None
+
+
 
     def _is_process_running_windows(self, image_name: str) -> bool:
         try:
@@ -1321,9 +1757,205 @@ class MainWindow(QWidget):
             return image_name.lower() in out and "no tasks are running" not in out
         except Exception:
             return False
+        
+    def is_vd_streamer_running(self) -> bool:
+        """
+        Robust check using PowerShell Get-Process.
+        Looks for VirtualDesktop.Streamer process by name (no .exe).
+        """
+        try:
+            cmd = [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-Command",
+                "if (Get-Process -Name 'VirtualDesktop.Streamer' -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
+            ]
+            subprocess.check_call(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+            return True
+        except Exception:
+            return False
+
+        
+    def _var_enabled_path(self, var_name: str) -> Path:
+        assert self.addon_dir is not None
+        return self.addon_dir / var_name
+
+    def _var_disabled_path(self, var_name: str) -> Path:
+        assert self.addon_dir is not None
+        return self.addon_dir / (var_name + DISABLED_SUFFIX)
+
+    def get_var_existing_path(self, var_name: str) -> Path | None:
+        """
+        Return actual file path that exists on disk:
+        - AddonPackages/<var_name> if exists
+        - else AddonPackages/<var_name>.disabled if exists
+        - else None
+        """
+        if not self.addon_dir:
+            return None
+        p1 = self._var_enabled_path(var_name)
+        if p1.exists():
+            return p1
+        p2 = self._var_disabled_path(var_name)
+        if p2.exists():
+            return p2
+        return None
+
+    def list_var_state_map(self) -> dict[str, str]:
+        """
+        Returns mapping: { "OrigName.var": "enabled" | "disabled" }
+        It normalizes both *.var and *.var.disabled to orig var name.
+        """
+        out: dict[str, str] = {}
+        if not self.addon_dir:
+            return out
+
+        # enabled
+        for p in self.addon_dir.glob("*.var"):
+            out[p.name] = "enabled"
+
+        # disabled
+        for p in self.addon_dir.glob("*.var.disabled"):
+            orig = p.name[:-len(DISABLED_SUFFIX)]
+            # if both exist, treat enabled as truth (prefer enabled)
+            if orig not in out:
+                out[orig] = "disabled"
+
+        return out
+
+    def all_var_names_catalog(self) -> set[str]:
+        """
+        Catalog of VAR names we know about from scene scan UI.
+        This does NOT depend on current file extension (.var vs .disabled).
+        """
+        return set(self.card_by_var.keys())
+
 
     def is_vam_running(self) -> bool:
         return self._is_process_running_windows("VaM.exe")
+
+    # ======================
+    # Update checker (GitHub)
+    # ======================
+    def _parse_version_tuple(self, v: str) -> tuple[int, int, int]:
+        m = re.search(r"(\d+)\.(\d+)\.(\d+)", v or "")
+        if not m:
+            return (0, 0, 0)
+        return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+
+    def _is_newer(self, latest: str, current: str) -> bool:
+        return self._parse_version_tuple(latest) > self._parse_version_tuple(current)
+
+    def _http_get_json(self, url: str, timeout: int = 10) -> dict:
+        req = urllib.request.Request(url, headers={"User-Agent": f"VSVM/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read().decode("utf-8", errors="ignore")
+        return json.loads(data)
+
+    def _download_file(self, url: str, dst: Path, timeout: int = 45):
+        req = urllib.request.Request(url, headers={"User-Agent": f"VSVM/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            dst.write_bytes(resp.read())
+
+    def _current_exe_path(self) -> Path:
+        return Path(sys.executable).resolve()
+
+    def _find_updater_exe(self) -> Path | None:
+        p = self._current_exe_path().parent / UPDATER_EXE_NAME
+        return p if p.exists() else None
+
+    def check_update_clicked(self):
+        try:
+            if self._startup_in_progress or self._refresh_in_progress:
+                QMessageBox.information(self, "Busy", "Please wait for current loading/refresh to finish.")
+                return
+
+            self.loading.start("Checking Update", "Contacting GitHub...")
+
+            info = self._http_get_json(GITHUB_LATEST_API)
+            tag = str(info.get("tag_name") or "").strip()
+            if not tag:
+                self.loading.stop()
+                QMessageBox.warning(self, "Update", "Could not read latest release tag.")
+                return
+
+            latest_ver = tag.lstrip("vV")
+            if not self._is_newer(latest_ver, APP_VERSION):
+                self.loading.stop()
+                QMessageBox.information(
+                    self, "Update",
+                    f"You are up to date.\n\nCurrent: {APP_VERSION}\nLatest: {latest_ver}"
+                )
+                return
+
+            assets = info.get("assets", [])
+            dl_url = None
+            for a in assets:
+                if str(a.get("name")) == RELEASE_ASSET_NAME:
+                    dl_url = a.get("browser_download_url")
+                    break
+
+            self.loading.stop()
+
+            if not dl_url:
+                QMessageBox.warning(
+                    self, "Update",
+                    f"New version found ({latest_ver}) but asset not found.\n\n"
+                    f"Expected asset name:\n{RELEASE_ASSET_NAME}"
+                )
+                return
+
+            reply = QMessageBox.question(
+                self, "Update Available",
+                f"New version is available!\n\nCurrent: {APP_VERSION}\nLatest: {latest_ver}\n\nInstall now?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+            self._download_and_install_update(latest_ver, dl_url)
+
+        except Exception as e:
+            self.loading.stop()
+            QMessageBox.warning(self, "Update", f"Update check failed:\n{e}")
+
+    def _download_and_install_update(self, latest_ver: str, dl_url: str):
+        updater = self._find_updater_exe()
+        if not updater:
+            QMessageBox.warning(
+                self, "Updater missing",
+                f"Update available ({latest_ver}) but {UPDATER_EXE_NAME} was not found.\n\n"
+                f"Place {UPDATER_EXE_NAME} next to:\n{self._current_exe_path().name}"
+            )
+            return
+
+        if not getattr(sys, "frozen", False):
+            QMessageBox.warning(
+                self, "Not supported",
+                "Update is only supported when running the built .exe.\n"
+                "Please run the packaged app and try again."
+            )
+            return
+
+        self.loading.start("Updating", "Downloading new version...")
+
+        try:
+            tmp_dir = Path(tempfile.gettempdir()) / "VSVM_updates"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+
+            new_exe = tmp_dir / f"VSVM_{latest_ver}.exe"
+            self._download_file(dl_url, new_exe)
+
+            self.loading.stop()
+
+            current_exe = self._current_exe_path()
+            subprocess.Popen([str(updater), str(current_exe), str(new_exe)], cwd=str(updater.parent))
+            QApplication.quit()
+
+        except Exception as e:
+            self.loading.stop()
+            QMessageBox.critical(self, "Update failed", f"Failed to download/install:\n{e}")
 
     # ======================
     # Folder selection & validation
@@ -1336,12 +1968,11 @@ class MainWindow(QWidget):
         return pp if pp.exists() else None
 
     def refresh_refresh_button(self):
-        # enabled if we have a current folder OR a saved last folder
         enabled = (self.vam_dir is not None) or (self.last_vam_dir() is not None)
-        # if a worker is running, disable
         if self._startup_in_progress or self._refresh_in_progress:
             enabled = False
         self.btn_refresh.setEnabled(enabled)
+        self.btn_check_update.setEnabled(not (self._startup_in_progress or self._refresh_in_progress))
 
     def validate_vam_folder(self, folder: Path) -> tuple[bool, str]:
         if not folder.exists() or not folder.is_dir():
@@ -1377,10 +2008,9 @@ class MainWindow(QWidget):
             pass
 
     # ======================
-    # Refresh button behavior
+    # Refresh behavior
     # ======================
     def refresh_clicked(self):
-        # Goal: check changes and update if needed (no forced full rescan).
         target = self.vam_dir or self.last_vam_dir()
         if not target:
             QMessageBox.information(self, "No folder", "No VaM folder selected yet.\nClick 'Select VaM Directory' first.")
@@ -1391,7 +2021,6 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, "Invalid folder", msg)
             return
 
-        # If user never loaded anything yet this run, initialize paths + show cached UI if possible
         if self.vam_dir is None:
             self.vam_dir = target
             self.addon_dir = target / "AddonPackages"
@@ -1403,7 +2032,6 @@ class MainWindow(QWidget):
 
         cache_obj = self._load_scene_cache()
         if self._can_use_cache_for_current_folder(cache_obj):
-            # show cached cards immediately (if UI empty)
             if not self.cards:
                 self.looks_map = cache_obj.get("looks", {}) if isinstance(cache_obj.get("looks"), dict) else {}
                 self.scene_entries = self._scene_entries_from_cache(cache_obj)
@@ -1427,11 +2055,10 @@ class MainWindow(QWidget):
                 self.apply_filter(self.search.text())
                 self.update_selection_ui()
 
-        # always run change check (if cache mismatch, it will rescan)
         self._start_change_check(cache_obj)
 
     # ======================
-    # Startup auto-load logic (cache-first)
+    # Startup cache-first
     # ======================
     def auto_open_last_folder_on_startup(self):
         last = self.last_vam_dir()
@@ -1452,6 +2079,7 @@ class MainWindow(QWidget):
 
         self.refresh_refresh_button()
         self.refresh_restore_button()
+        self.refresh_apply_button()
 
         cache_obj = self._load_scene_cache()
         if self._can_use_cache_for_current_folder(cache_obj):
@@ -1480,14 +2108,10 @@ class MainWindow(QWidget):
             self.apply_filter(self.search.text())
             self.update_selection_ui()
 
-            # scene card is present now -> close the startup popup (requirement #1)
             self.loading.stop()
-
-            # Background lightweight check
             self._start_change_check(cache_obj)
             return
 
-        # No usable cache -> do normal scan (keep loading popup until done)
         self.set_current_vam_dir(last)
 
     def _can_use_cache_for_current_folder(self, cache_obj: dict) -> bool:
@@ -1563,9 +2187,7 @@ class MainWindow(QWidget):
             self._end_busy()
             return
 
-        # Changes detected -> run AnalyzeWorker (fast due to signature reuse)
         self.status.setText("Changes detected. Updating cache...")
-        # keep popup visible while rescanning
         self.loading.start("Updating", "Scanning changes...")
 
         old_cache = self._load_scene_cache()
@@ -1613,11 +2235,11 @@ class MainWindow(QWidget):
 
         self.refresh_refresh_button()
         self.refresh_restore_button()
+        self.refresh_apply_button()
 
         self.scene_entries = []
         self.total_scene_files_found = 0
 
-        # show loading popup for full scan
         self.loading.start("Loading", "Scanning scenes...")
 
         self.status.setText("Scanning scenes...")
@@ -1672,12 +2294,52 @@ class MainWindow(QWidget):
         self.apply_filter(self.search.text())
         self.update_selection_ui()
 
-        # requirement #1: hide popup after process done and cards appear
+        self.refresh_restore_button()
+        self.refresh_apply_button()
+
         self._end_busy()
 
     # ======================
     # Cards
     # ======================
+
+    def _start_lazy_preview_loader(self):
+        if hasattr(self, "_preview_timer") and self._preview_timer.isActive():
+            self._preview_timer.stop()
+
+        self._preview_queue = [
+            c for c in self.cards
+            if getattr(c, "_preview_rel", "") and not getattr(c, "_preview_loaded", False)
+        ]
+
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setInterval(1)  # cepat tapi non-blocking
+        self._preview_timer.timeout.connect(self._lazy_preview_tick)
+        self._preview_timer.start()
+
+
+    def _lazy_preview_tick(self):
+        # load max 8 preview per tick (AMAN)
+        for _ in range(8):
+            if not self._preview_queue:
+                self._preview_timer.stop()
+                return
+
+            c = self._preview_queue.pop(0)
+            rel = getattr(c, "_preview_rel", "")
+            if not rel:
+                continue
+
+            img = read_preview_bytes(rel)
+            if img:
+                try:
+                    c.set_preview_image_bytes(img)
+                except Exception:
+                    pass
+
+            c._preview_loaded = True
+
+    
     def populate_scene_cards_from_entries(self):
         self.cards = []
         self.card_by_var = {}
@@ -1693,9 +2355,12 @@ class MainWindow(QWidget):
             var_name = e.get("var_name", "")
             rel = e.get("preview_relpath", "") or ""
 
-            image_bytes = read_preview_bytes(rel)
+            card = SceneCard(scene_name=scene_name, var_name=var_name, image_bytes=None)
 
-            card = SceneCard(scene_name=scene_name, var_name=var_name, image_bytes=image_bytes)
+            # simpan rel path untuk lazy load
+            card._preview_rel = rel
+            card._preview_loaded = False
+
             card.clicked.connect(self.on_card_clicked)
 
             selectable = (source == "var")
@@ -1717,6 +2382,8 @@ class MainWindow(QWidget):
             self.cards.append(card)
 
         self.rebuild_grid(self.cards)
+        self._start_lazy_preview_loader()
+
 
     def rebuild_grid(self, cards_to_show: list[SceneCard]):
         while self.scene_grid.count():
@@ -1785,7 +2452,7 @@ class MainWindow(QWidget):
         self.rebuild_grid(selected_matches + other_matches)
 
     # ======================
-    # Looks-only (lazy)
+    # Looks-only
     # ======================
     def on_toggle_looks_only(self, _state: int):
         if not self.chk_girl_looks_only.isChecked():
@@ -1848,20 +2515,46 @@ class MainWindow(QWidget):
     # ======================
     def on_toggle_selection_mode(self, _state: int):
         enabled = self.is_selection_mode()
-        for card in self.cards:
-            src = getattr(card, "source", "var")
-            selectable = (src == "var")
-            card.set_selection_mode(enabled and selectable)
-            if selectable:
-                card.set_checked(card.var_name in self.selected_scene_vars)
-            else:
-                card.set_checked(False)
+
+        self.scene_container.setUpdatesEnabled(False)
+        try:
+            for card in self.cards:
+                src = getattr(card, "source", "var")
+                selectable = (src == "var")
+                card.set_selection_mode(enabled and selectable)
+                if selectable:
+                    card.set_checked(card.var_name in self.selected_scene_vars)
+                else:
+                    card.set_checked(False)
+        finally:
+            self.scene_container.setUpdatesEnabled(True)
 
         self.apply_filter(self.search.text())
         self.update_selection_ui()
 
+
+    def _check_selection_dirty(self):
+        # Only care while VaM is running OR lean session is active
+        if not (self.is_vam_running() or self.lean_active):
+            self.selection_dirty = False
+            self.set_apply_attention(False)
+            return
+
+        current = set(self._scene_vars_for_launch())
+        dirty = (current != set(self.session_baseline_scene_vars))
+
+        if dirty != self.selection_dirty:
+            self.selection_dirty = dirty
+            self.set_apply_attention(dirty)
+
+
     def _set_var_selected(self, var_name: str, selected: bool):
         if self._syncing_selection_ui:
+            return
+
+        # short-circuit if nothing changes (saves tons of work)
+        already = (var_name in self.selected_scene_vars)
+        if selected == already:
             return
 
         self._syncing_selection_ui = True
@@ -1871,14 +2564,21 @@ class MainWindow(QWidget):
             else:
                 self.selected_scene_vars.discard(var_name)
 
+            # update card checkmarks (cheap)
             for c in self.card_by_var.get(var_name, []):
                 c.set_checked(selected)
         finally:
             self._syncing_selection_ui = False
 
-        if not self._batch_selection:
-            self.apply_filter(self.search.text())
-            self.update_selection_ui()
+        # IMPORTANT: during batch, don't rebuild grid / update labels / style every click
+        if self._batch_selection:
+            return
+
+        self.apply_filter(self.search.text())
+        self.update_selection_ui()
+        self._schedule_check_selection_dirty()
+
+
 
     def update_selection_ui(self):
         self.selection_info.setText(
@@ -1897,31 +2597,27 @@ class MainWindow(QWidget):
         if not self.cards:
             return
 
-        self._batch_selection = True
-        self.scene_container.setUpdatesEnabled(False)
+        self._begin_batch_selection()
         try:
             for var_name, cards in self.card_by_var.items():
                 if any(c.isVisible() for c in cards):
                     self._set_var_selected(var_name, True)
         finally:
-            self._batch_selection = False
-            self.scene_container.setUpdatesEnabled(True)
+            self._end_batch_selection()
 
-        self.apply_filter(self.search.text())
-        self.update_selection_ui()
 
     def clear_selection(self):
-        self._batch_selection = True
-        self.scene_container.setUpdatesEnabled(False)
+        if not self.selected_scene_vars:
+            return
+
+        self._begin_batch_selection()
         try:
             for var_name in list(self.selected_scene_vars):
                 self._set_var_selected(var_name, False)
+            self.selected_scene_vars.clear()
         finally:
-            self._batch_selection = False
-            self.scene_container.setUpdatesEnabled(True)
+            self._end_batch_selection()
 
-        self.apply_filter(self.search.text())
-        self.update_selection_ui()
 
     def on_card_clicked(self, scene_name: str, var_name: str):
         clicked_card = None
@@ -1971,11 +2667,28 @@ class MainWindow(QWidget):
     def show_dependencies(self, scene_name: str, var_name: str):
         if not self.addon_dir:
             return
+
         self.dep_selected.setText(f"Selected:\n{scene_name}\n{var_name}")
 
-        info = scan_var(self.addon_dir / var_name)
+        var_path = self.get_var_existing_path(var_name)
+        if not var_path:
+            # file bisa saja hilang benar-benar (user delete manual), jangan crash
+            self.dep_summary.setText("VAR file not found on disk (enabled/disabled).")
+            while self.dep_list_layout.count():
+                item = self.dep_list_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+            self.dep_list_layout.addWidget(QLabel("(missing on disk)"))
+            self.dep_list_layout.addStretch(1)
+            return
+
+        info = scan_var(var_path)
+
         deps = sorted(info.get("dependencies", []))
-        all_vars = {p.name for p in self.addon_dir.glob("*.var")}
+
+        # IMPORTANT: all vars should include disabled too
+        all_vars = set(self.list_var_state_map().keys())
 
         while self.dep_list_layout.count():
             item = self.dep_list_layout.takeAt(0)
@@ -1998,7 +2711,10 @@ class MainWindow(QWidget):
             if present:
                 present_count += 1
                 chosen = sorted(matched)[-1]
-                text = f"{dep}  →  {chosen}"
+                # show if chosen currently disabled or enabled
+                state = self.list_var_state_map().get(chosen, "")
+                suffix = " (disabled)" if state == "disabled" else ""
+                text = f"{dep}  →  {chosen}{suffix}"
             else:
                 missing_count += 1
                 text = f"{dep}  →  (missing)"
@@ -2008,8 +2724,9 @@ class MainWindow(QWidget):
         self.dep_list_layout.addStretch(1)
         self.dep_summary.setText(f"Total: {len(deps)} | Present: {present_count} | Missing: {missing_count}")
 
+
     # ======================
-    # Restore / Launch (RENAME METHOD)
+    # Restore / Apply / Launch (RENAME METHOD)
     # ======================
     def refresh_restore_button(self):
         if not self.vam_dir:
@@ -2017,6 +2734,40 @@ class MainWindow(QWidget):
             return
         mp = manifest_path_for(self.vam_dir)
         self.btn_restore.setEnabled(mp.exists())
+
+    def refresh_apply_button(self):
+        """
+        Apply button becomes useful if:
+        - VaM is running (user wants live apply), OR
+        - a manifest exists (lean session active), OR
+        - we have a folder selected (we can start live mode even if VaM already running)
+        """
+        if not self.vam_dir:
+            self.btn_apply_now.setEnabled(False)
+            return
+        mp_exists = manifest_path_for(self.vam_dir).exists()
+        running = self.is_vam_running()
+        self.btn_apply_now.setEnabled(running or mp_exists)
+
+    def _read_manifest(self) -> dict:
+        if not self.vam_dir:
+            return {}
+        mp = manifest_path_for(self.vam_dir)
+        if not mp.exists():
+            return {}
+        try:
+            return json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _write_manifest(self, manifest: dict):
+        if not self.vam_dir:
+            return
+        mp = manifest_path_for(self.vam_dir)
+        try:
+            mp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def restore_offloaded_vars(self):
         if not self.vam_dir:
@@ -2029,6 +2780,7 @@ class MainWindow(QWidget):
         if not mp.exists():
             QMessageBox.information(self, "Nothing to restore", "No manifest found.")
             self.refresh_restore_button()
+            self.refresh_apply_button()
             return
 
         try:
@@ -2068,8 +2820,13 @@ class MainWindow(QWidget):
         self.vam_seen_running = False
         self.poll_timer.stop()
 
+        self.session_baseline_scene_vars = set()
+        self.selection_dirty = False
+        self.set_apply_attention(False)
+
         QMessageBox.information(self, "Restored", f"Restored {restored} VARs back to normal in:\n{addon_dir}")
         self.refresh_restore_button()
+        self.refresh_apply_button()
 
     def _scene_vars_for_launch(self) -> set[str]:
         if self.selected_scene_vars:
@@ -2078,50 +2835,75 @@ class MainWindow(QWidget):
 
     def compute_keep_set_for_scene_vars(self, scene_vars: set[str]) -> set[str]:
         assert self.addon_dir is not None
-        all_vars = {p.name for p in self.addon_dir.glob("*.var")}
 
+        # ✅ IMPORTANT: dependency universe must be ALL vars on disk (enabled + disabled)
+        all_vars = self.all_var_names_on_disk()
+
+        # Protect assets/plugins by name (same behavior as before, but now sees everything)
         protected = {v for v in all_vars if is_asset_var(v)}
         protected |= {v for v in all_vars if "[plugin]" in v.lower()}
 
         keep = set(protected)
         queue: list[str] = []
 
+        # Seed selected scene vars
         for scene_var in scene_vars:
             if scene_var in all_vars:
                 keep.add(scene_var)
-                info = scan_var(self.addon_dir / scene_var)
-                queue.extend(list(info.get("dependencies", [])))
+                p = self.get_var_existing_path(scene_var)
+                if p:
+                    info = scan_var(p)
+                    queue.extend(list(info.get("dependencies", [])))
 
+        # Resolve dependencies recursively
         while queue:
             dep = queue.pop()
             for matched_var in resolve_dependency(dep, all_vars):
                 if matched_var not in keep:
                     keep.add(matched_var)
-                    info = scan_var(self.addon_dir / matched_var)
-                    queue.extend(list(info.get("dependencies", [])))
+                    p = self.get_var_existing_path(matched_var)
+                    if p:
+                        info = scan_var(p)
+                        queue.extend(list(info.get("dependencies", [])))
 
         return keep
 
+
+
     def disable_unrelated_vars_by_rename(self, keep_set: set[str]) -> dict:
+        """
+        Initial disable pass (used when starting a session).
+        Works with both enabled and disabled state.
+        Only disables currently enabled .var that are not in keep_set.
+        """
         assert self.vam_dir is not None
         addon_dir = self.vam_dir / "AddonPackages"
         mp = manifest_path_for(self.vam_dir)
 
         renamed: list[dict] = []
-        for var_path in addon_dir.glob("*.var"):
-            name = var_path.name
-            if name in keep_set:
+
+        # Use state map so we don't miss vars that exist but currently disabled
+        state_map = self.list_var_state_map()
+
+        for orig_name, state in state_map.items():
+            if orig_name in keep_set:
                 continue
 
-            disabled = disabled_name(name)
-            disabled_path = addon_dir / disabled
+            # Only disable if currently enabled
+            if state != "enabled":
+                continue
 
-            if disabled_path.exists():
+            src = addon_dir / orig_name
+            dst = addon_dir / (orig_name + DISABLED_SUFFIX)
+
+            if not src.exists():
+                continue
+            if dst.exists():
                 continue
 
             try:
-                var_path.rename(disabled_path)
-                renamed.append({"from": name, "to": disabled})
+                src.rename(dst)
+                renamed.append({"from": orig_name, "to": dst.name})
             except Exception:
                 continue
 
@@ -2136,13 +2918,203 @@ class MainWindow(QWidget):
         mp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return manifest
 
+
+    def _apply_keep_set_live(self, keep_set: set[str]) -> tuple[int, int]:
+        """
+        LIVE apply:
+        - Restore anything that should now be kept (if currently disabled by our tool)
+        - Disable anything not in keep_set (but only if currently enabled)
+        Returns: (disabled_count, restored_count)
+        """
+        assert self.vam_dir is not None
+        addon_dir = self.vam_dir / "AddonPackages"
+        mp = manifest_path_for(self.vam_dir)
+
+        manifest = self._read_manifest()
+        renamed_list = manifest.get("renamed", [])
+        if not isinstance(renamed_list, list):
+            renamed_list = []
+
+        # tool_map: orig -> disabled_filename (only what tool is responsible for)
+        tool_map: dict[str, str] = {}
+        for item in renamed_list:
+            if not isinstance(item, dict):
+                continue
+            o = item.get("from")
+            d = item.get("to")
+            if isinstance(o, str) and isinstance(d, str) and o and d:
+                tool_map[o] = d
+
+        disabled_count = 0
+        restored_count = 0
+
+        state_map = self.list_var_state_map()
+
+        # 1) Restore tool-disabled vars that are now in keep_set
+        for orig, dis_name in list(tool_map.items()):
+            if orig not in keep_set:
+                continue
+
+            src = addon_dir / dis_name
+            dst = addon_dir / orig
+
+            if src.exists() and not dst.exists():
+                try:
+                    src.rename(dst)
+                    restored_count += 1
+                    # remove from tool_map because it's no longer disabled by tool
+                    tool_map.pop(orig, None)
+                except Exception:
+                    pass
+
+        # Refresh state after restores
+        state_map = self.list_var_state_map()
+
+        # 2) Disable vars NOT in keep_set (only if currently enabled)
+        # IMPORTANT: Use catalog so it still works when most are disabled
+        catalog = self.all_var_names_catalog()
+        if not catalog:
+            catalog = set(state_map.keys())
+
+        for orig in catalog:
+            if orig in keep_set:
+                continue
+
+            # Already disabled by our tool?
+            if orig in tool_map:
+                continue
+
+            # Only disable if currently enabled on disk
+            if state_map.get(orig) != "enabled":
+                continue
+
+            src = addon_dir / orig
+            dst = addon_dir / (orig + DISABLED_SUFFIX)
+
+            if not src.exists():
+                continue
+            if dst.exists():
+                # don't overwrite; safest do nothing
+                continue
+
+            try:
+                src.rename(dst)
+                tool_map[orig] = dst.name
+                disabled_count += 1
+            except Exception:
+                pass
+
+        # 3) Write updated manifest from tool_map (only what tool currently disables)
+        new_manifest = {
+            "addon_dir": str(addon_dir),
+            "method": "rename_disabled",
+            "disabled_suffix": DISABLED_SUFFIX,
+            "renamed": [{"from": o, "to": d} for o, d in sorted(tool_map.items())],
+            "saved_at": time.time(),
+        }
+        try:
+            mp.write_text(json.dumps(new_manifest, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+        return disabled_count, restored_count
+
+
+    def apply_selection_now_clicked(self):
+        """
+        If VaM is running, user can click Apply anytime.
+        - If no manifest yet: we can start live mode now (creates manifest).
+        - Then we apply current keep_set live.
+        """
+        if not self.vam_dir or not self.addon_dir:
+            QMessageBox.warning(self, "No folder", "Select VaM directory first.")
+            return
+
+        running = self.is_vam_running()
+        mp = manifest_path_for(self.vam_dir)
+        mp_exists = mp.exists()
+
+        if not running and not mp_exists:
+            QMessageBox.information(
+                self, "Not available",
+                "Apply Selection Now is used while VaM is running (live), or when a lean session is active.\n\n"
+                "Launch VaM from this app, or open VaM and try again."
+            )
+            self.refresh_apply_button()
+            return
+
+        if running and not mp_exists:
+            reply = QMessageBox.question(
+                self,
+                "Start Live Lean Mode",
+                "VaM is running but no lean session is active.\n\n"
+                "This will start a Live Lean Mode NOW by renaming unrelated .var files.\n"
+                "After applying, you may need to use VaM's in-game refresh/rescan button.\n\n"
+                "Continue?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+            
+            self.session_baseline_scene_vars = set(self._scene_vars_for_launch())
+            self.selection_dirty = False
+            self.set_apply_attention(False)
+
+        # Apply live changes
+        try:
+            scene_vars = self._scene_vars_for_launch()
+            keep_set = self.compute_keep_set_for_scene_vars(scene_vars)
+
+            self.progress.setVisible(True)
+            self.progress.setRange(0, 0)
+            self.status.setText("Applying selection (live)...")
+
+            # If no manifest exists yet, do initial disable to create manifest
+            if not mp_exists:
+                self.disable_unrelated_vars_by_rename(keep_set)
+
+            disabled_n, restored_n = self._apply_keep_set_live(keep_set)
+
+            # update baseline after successful apply
+            self.session_baseline_scene_vars = set(self._scene_vars_for_launch())
+            self.selection_dirty = False
+            self.set_apply_attention(False)
+
+
+            # Mark session active and start monitoring (if VaM already running, mark as seen)
+            self.lean_active = True
+            self.vam_seen_running = running
+            self.poll_timer.start()
+
+            self.progress.setVisible(False)
+            self.status.setText(f"VaM Directory:\n{self.vam_dir}")
+
+            QMessageBox.information(
+                self,
+                "Applied",
+                f"Applied selection.\n\nDisabled: {disabled_n}\nRestored: {restored_n}\n\n"
+                f"Tip: In VaM, use its refresh/rescan packages button if needed."
+            )
+
+        except Exception as e:
+            self.progress.setVisible(False)
+            self.status.setText(f"VaM Directory:\n{self.vam_dir}")
+            QMessageBox.critical(self, "Apply failed", f"Failed to apply selection:\n{e}")
+
+        self.refresh_restore_button()
+        self.refresh_apply_button()
+
     def _start_lean_session_or_warn(self) -> bool:
+        """
+        For launching: we still require VaM is NOT running.
+        Live mode uses Apply Selection Now instead.
+        """
         if not self.vam_dir or not self.addon_dir:
             QMessageBox.warning(self, "No folder", "Select VaM directory first.")
             return False
 
         if self.is_vam_running():
-            QMessageBox.warning(self, "VaM is running", "Close VaM.exe first, then launch from this app.")
+            QMessageBox.warning(self, "VaM is running", "Close VaM.exe first, then launch from this app.\n\n(Use Apply Selection Now for live changes.)")
             return False
 
         if self.lean_active:
@@ -2161,8 +3133,8 @@ class MainWindow(QWidget):
         reply = QMessageBox.question(
             self,
             "Lean Launch",
-            "This will TEMPORARILY disable unrelated .var files by renaming them.\n"
-            "Example: Something.var → Something.var.disabled\n"
+            "This will TEMPORARILY disable unrelated .var files to your current scene selection"
+            "By renaming extension to .disable"
             "When VaM.exe closes, it will restore them.\n\nContinue?",
             QMessageBox.Yes | QMessageBox.No
         )
@@ -2175,13 +3147,113 @@ class MainWindow(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to disable vars:\n{e}")
             self.refresh_restore_button()
+            self.refresh_apply_button()
             return False
 
         self.lean_active = True
         self.vam_seen_running = False
         self.poll_timer.start()
+        # baseline selection for this session
+        self.session_baseline_scene_vars = set(self._scene_vars_for_launch())
+        self.selection_dirty = False
+        self.set_apply_attention(False)
+
         self.refresh_restore_button()
+        self.refresh_apply_button()
         return True
+    
+        # ======================
+    # Virtual Desktop Streamer helpers
+    # ======================
+    def get_vd_streamer_path(self) -> Path | None:
+        """
+        Returns saved VirtualDesktop.Streamer.exe path if valid.
+        Stored in self.cfg["vd_streamer_path"].
+        """
+        p = self.cfg.get("vd_streamer_path", "")
+        if not p:
+            return None
+        pp = Path(p)
+        return pp if pp.exists() and pp.is_file() else None
+
+    def ensure_vd_streamer_path(self) -> Path | None:
+        """
+        Priority:
+        1) If VD Streamer process is running, read its real path and save it.
+        2) Else: use saved config path if valid.
+        3) Else: ask user to locate VirtualDesktop.Streamer.exe (optional fallback).
+        """
+        # 1) If running, discover from process and save
+        running_path = self.find_running_vd_streamer_path()
+        if running_path:
+            self.cfg["vd_streamer_path"] = str(running_path)
+            save_config(self.cfg)
+            return running_path
+
+        # 2) Use saved config path
+        p = self.cfg.get("vd_streamer_path", "")
+        if p:
+            pp = Path(p)
+            if pp.exists() and pp.is_file():
+                return pp
+
+        # 3) Optional fallback: ask user (you can keep or remove this)
+        picked, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select VirtualDesktop.Streamer.exe",
+            "",
+            "Executable (*.exe)"
+        )
+        if not picked:
+            return None
+
+        pp = Path(picked)
+        if not pp.exists() or not pp.is_file():
+            QMessageBox.warning(self, "Invalid file", "Selected file does not exist.")
+            return None
+
+        self.cfg["vd_streamer_path"] = str(pp)
+        save_config(self.cfg)
+        return pp
+
+
+    def launch_vam_vd_lean(self):
+        # 1) basic validation
+        if not self.vam_dir or not self.addon_dir:
+            QMessageBox.warning(self, "No folder", "Select VaM directory first.")
+            return
+
+        # 2) NEW running gate (path-based, reliable)
+        vd_streamer = self.find_running_vd_streamer_path()
+        if not vd_streamer:
+            QMessageBox.information(
+                self,
+                "Virtual Desktop not running",
+                "Virtual Desktop Streamer is not running.\n\n"
+                "Please start Virtual Desktop Streamer first, then try again."
+            )
+            return
+
+        # 3) start lean session (NOW vars can be renamed)
+        if not self._start_lean_session_or_warn():
+            return
+
+        # 4) launch VaM via VD
+        vam_exe = self.get_vam_exe_path()
+        if not vam_exe:
+            QMessageBox.critical(self, "Error", "VaM.exe not found.")
+            self.restore_offloaded_vars()
+            return
+
+        subprocess.Popen(
+            [str(vd_streamer), str(vam_exe)],
+            cwd=str(vd_streamer.parent),
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+
+        self.status.setText("Launched VaM via Virtual Desktop. Monitoring until it closes...")
+        self.refresh_apply_button()
+
 
     def launch_vam_exe_lean(self):
         if not self._start_lean_session_or_warn():
@@ -2201,6 +3273,7 @@ class MainWindow(QWidget):
             return
 
         self.status.setText("Launched VaM.exe. Monitoring until it closes...")
+        self.refresh_apply_button()
 
     def launch_vam_launcher_lean(self):
         if not self._start_lean_session_or_warn():
@@ -2220,10 +3293,14 @@ class MainWindow(QWidget):
             return
 
         self.status.setText("Launched VaM Launcher. Waiting for VaM.exe to start (desktop/VR)...")
+        self.refresh_apply_button()
 
     def check_vam_state(self):
+
+        self.refresh_apply_button()
+
         if not self.lean_active:
-            self.poll_timer.stop()
+          
             return
 
         running = self.is_vam_running()
@@ -2243,7 +3320,7 @@ class MainWindow(QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    icon_path = Path("icons/app.ico")
+    icon_path = resource_path("icons/app.ico")
     if icon_path.exists():
         icon = QIcon(str(icon_path))
         app.setWindowIcon(icon)
