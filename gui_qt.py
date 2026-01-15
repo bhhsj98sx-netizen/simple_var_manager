@@ -1,5 +1,6 @@
 import sys
 import os
+import sys
 import json
 import subprocess
 import zipfile
@@ -8,23 +9,30 @@ import hashlib
 import urllib.request
 import re
 import tempfile
+import queue
+from collections import deque
+from queue import PriorityQueue
+import itertools
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton,
     QVBoxLayout, QFileDialog, QProgressBar, QMessageBox,
-    QScrollArea, QGridLayout, QLineEdit,
+    QScrollArea, QLineEdit, QListView,
     QHBoxLayout, QFrame, QCheckBox, QDialog, QTextEdit, QComboBox, QTextBrowser,
-    QSpacerItem, QSizePolicy, QInputDialog
+    QSpacerItem, QSizePolicy, QInputDialog, QStyledItemDelegate, QStyle
 )
-from PySide6.QtCore import QThread, Signal, Qt, QTimer, QEvent, QSize
-from PySide6.QtGui import QIcon, QDesktopServices, QPalette
+from PySide6.QtCore import QThread, Signal, Qt, QTimer, QEvent, QSize, QAbstractListModel, QSortFilterProxyModel, QModelIndex, QRect
+from PySide6.QtGui import QIcon, QDesktopServices, QPalette, QPixmap, QPainter, QColor, QFontMetrics, QImage
+from PySide6.QtCore import QBuffer
 
 from PySide6.QtCore import QUrl
 
 from core.resolver import resolve_dependency, is_asset_var
-from core.scanner import scan_var
-from core.scene_card import SceneCard
+from core.scanner import scan_var_meta_only, read_file_from_var
+
 
 def resource_path(rel_path: str) -> Path:
     """
@@ -308,6 +316,328 @@ def read_preview_bytes(rel_path: str) -> bytes | None:
         return None
     return None
 
+def _read_preview_from_var(var_path: Path, scene_name: str, inner_hint: str) -> tuple[bytes | None, str]:
+    """
+    Best-effort read for scene preview image from a var zip.
+    Tries hint, common paths, then case-insensitive scan (single zip open).
+    """
+    try:
+        with zipfile.ZipFile(var_path, "r") as z:
+            if inner_hint:
+                try:
+                    return z.read(inner_hint), inner_hint
+                except Exception:
+                    pass
+
+            for ext in (".png", ".jpg", ".jpeg"):
+                cand = f"Saves/scene/{scene_name}{ext}"
+                try:
+                    return z.read(cand), cand
+                except Exception:
+                    pass
+
+            base = scene_name.lower()
+            for name in z.namelist():
+                ln = name.lower()
+                if not ln.startswith("saves/scene/"):
+                    continue
+                if not (ln.endswith(".png") or ln.endswith(".jpg") or ln.endswith(".jpeg")):
+                    continue
+                if Path(ln).stem == base:
+                    try:
+                        return z.read(name), name
+                    except Exception:
+                        pass
+    except Exception:
+        return None, ""
+
+    return None, ""
+
+
+# ======================
+# Scene list model/view (lightweight)
+# ======================
+ROLE_SCENE = Qt.UserRole + 1
+ROLE_VAR = Qt.UserRole + 2
+ROLE_SOURCE = Qt.UserRole + 3
+ROLE_PREVIEW_REL = Qt.UserRole + 4
+ROLE_PREVIEW_INNER = Qt.UserRole + 5
+ROLE_PREVIEW_PIXMAP = Qt.UserRole + 6
+ROLE_SELECTED = Qt.UserRole + 7
+ROLE_ACTIVE = Qt.UserRole + 8
+ROLE_LOOKS = Qt.UserRole + 9
+ROLE_LOOSE = Qt.UserRole + 10
+ROLE_SELECTION_MODE = Qt.UserRole + 11
+
+
+class SceneListModel(QAbstractListModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items: list[dict] = []
+        self._rows_by_var: dict[str, list[int]] = {}
+        self._active_row: int = -1
+        self._selection_mode: bool = False
+
+    def rowCount(self, parent=QModelIndex()) -> int:  # type: ignore[override]
+        if parent.isValid():
+            return 0
+        return len(self._items)
+
+    def data(self, index: QModelIndex, role: int = Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        item = self._items[index.row()]
+        if role == Qt.DisplayRole:
+            return item.get("scene_name", "")
+        if role == Qt.ToolTipRole:
+            return f"{item.get('scene_name', '')}\n{item.get('var_name', '')}"
+        if role == ROLE_SCENE:
+            return item.get("scene_name", "")
+        if role == ROLE_VAR:
+            return item.get("var_name", "")
+        if role == ROLE_SOURCE:
+            return item.get("source", "var")
+        if role == ROLE_PREVIEW_REL:
+            return item.get("preview_relpath", "")
+        if role == ROLE_PREVIEW_INNER:
+            return item.get("preview_inner", "")
+        if role == ROLE_PREVIEW_PIXMAP:
+            return item.get("preview_pixmap", None)
+        if role == ROLE_SELECTED:
+            return bool(item.get("selected", False))
+        if role == ROLE_ACTIVE:
+            return bool(item.get("active", False))
+        if role == ROLE_LOOKS:
+            return item.get("is_girl_looks", None)
+        if role == ROLE_LOOSE:
+            return item.get("loose_relpath", "")
+        if role == ROLE_SELECTION_MODE:
+            return self._selection_mode
+        return None
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlags:  # type: ignore[override]
+        if not index.isValid():
+            return Qt.NoItemFlags
+        return Qt.ItemIsEnabled
+
+    def set_entries(self, entries: list[dict]):
+        self.beginResetModel()
+        self._items = []
+        self._rows_by_var = {}
+        self._active_row = -1
+
+        for e in entries:
+            item = {
+                "scene_name": e.get("scene_name", "") or "",
+                "var_name": e.get("var_name", "") or "",
+                "source": e.get("source", "var") or "var",
+                "preview_relpath": e.get("preview_relpath", "") or "",
+                "preview_inner": e.get("preview_inner", "") or "",
+                "scene_path": e.get("scene_path", "") or "",
+                "preview_pixmap": None,
+                "selected": False,
+                "active": False,
+                "is_girl_looks": e.get("is_girl_looks", None),
+                "loose_relpath": e.get("loose_relpath", "") or "",
+            }
+            self._items.append(item)
+            var_name = item["var_name"]
+            if var_name and item.get("source", "var") == "var":
+                self._rows_by_var.setdefault(var_name, []).append(len(self._items) - 1)
+        self.endResetModel()
+
+    def set_selection_mode(self, enabled: bool):
+        self._selection_mode = bool(enabled)
+        if self._items:
+            top = self.index(0, 0)
+            bottom = self.index(len(self._items) - 1, 0)
+            self.dataChanged.emit(top, bottom, [ROLE_SELECTION_MODE])
+
+    def row_indexes_for_var(self, var_name: str) -> list[int]:
+        return list(self._rows_by_var.get(var_name, []))
+
+    def var_names(self) -> set[str]:
+        return set(self._rows_by_var.keys())
+
+    def get_item(self, row: int) -> dict:
+        if 0 <= row < len(self._items):
+            return self._items[row]
+        return {}
+
+    def set_selected_for_var(self, var_name: str, selected: bool):
+        rows = self._rows_by_var.get(var_name, [])
+        if not rows:
+            return
+        for r in rows:
+            self._items[r]["selected"] = bool(selected)
+        top = self.index(min(rows), 0)
+        bottom = self.index(max(rows), 0)
+        self.dataChanged.emit(top, bottom, [ROLE_SELECTED])
+
+    def set_selected_for_rows(self, rows: list[int], selected: bool):
+        if not rows:
+            return
+        for r in rows:
+            if 0 <= r < len(self._items):
+                self._items[r]["selected"] = bool(selected)
+        top = self.index(min(rows), 0)
+        bottom = self.index(max(rows), 0)
+        self.dataChanged.emit(top, bottom, [ROLE_SELECTED])
+
+    def set_active_row(self, row: int):
+        if row == self._active_row:
+            return
+        old = self._active_row
+        self._active_row = row
+        if 0 <= old < len(self._items):
+            self._items[old]["active"] = False
+            idx = self.index(old, 0)
+            self.dataChanged.emit(idx, idx, [ROLE_ACTIVE])
+        if 0 <= row < len(self._items):
+            self._items[row]["active"] = True
+            idx = self.index(row, 0)
+            self.dataChanged.emit(idx, idx, [ROLE_ACTIVE])
+
+    def set_preview_pixmap(self, row: int, pix: QPixmap | None):
+        if 0 <= row < len(self._items):
+            self._items[row]["preview_pixmap"] = pix
+            idx = self.index(row, 0)
+            self.dataChanged.emit(idx, idx, [ROLE_PREVIEW_PIXMAP])
+
+    def set_looks_map(self, looks_map: dict):
+        if not isinstance(looks_map, dict):
+            return
+        for i, item in enumerate(self._items):
+            if item.get("source", "var") != "var":
+                continue
+            k = f"{item.get('var_name', '')}::{item.get('scene_name', '')}"
+            if k in looks_map:
+                item["is_girl_looks"] = looks_map.get(k, False)
+                idx = self.index(i, 0)
+                self.dataChanged.emit(idx, idx, [ROLE_LOOKS])
+
+
+class SceneFilterProxy(QSortFilterProxyModel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._text = ""
+        self._looks_only = False
+
+    def set_filter_text(self, text: str):
+        self._text = (text or "").strip().lower()
+        self.invalidateRowsFilter()
+
+    def set_looks_only(self, enabled: bool):
+        self._looks_only = bool(enabled)
+        self.invalidateRowsFilter()
+
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:  # type: ignore[override]
+        index = self.sourceModel().index(source_row, 0, source_parent)
+        scene = (index.data(ROLE_SCENE) or "").lower()
+        var = (index.data(ROLE_VAR) or "").lower()
+        if self._text:
+            if self._text not in scene and self._text not in var:
+                return False
+
+        if self._looks_only:
+            if index.data(ROLE_SOURCE) != "var":
+                return False
+            looks_val = index.data(ROLE_LOOKS)
+            if looks_val is None:
+                return False
+            if not bool(looks_val):
+                return False
+
+        return True
+
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:  # type: ignore[override]
+        lvar = (left.data(ROLE_VAR) or "").lower()
+        rvar = (right.data(ROLE_VAR) or "").lower()
+        if lvar != rvar:
+            return lvar < rvar
+        lscene = (left.data(ROLE_SCENE) or "").lower()
+        rscene = (right.data(ROLE_SCENE) or "").lower()
+        return lscene < rscene
+
+
+class SceneDelegate(QStyledItemDelegate):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.card_w = 220
+        self.card_h = 210
+        self.img_w = 200
+        self.img_h = 130
+        self.pad = 10
+        self.text_h = 44
+
+    def set_card_width(self, width: int):
+        w = max(140, int(width))
+        self.card_w = w
+        self.img_w = max(80, w - self.pad * 2)
+        self.img_h = max(80, int(self.img_w * 0.65))
+        self.card_h = self.pad + self.img_h + 8 + self.text_h + self.pad
+
+    def image_size(self) -> QSize:
+        return QSize(self.img_w, self.img_h)
+
+    def sizeHint(self, option, index):  # type: ignore[override]
+        return QSize(self.card_w, self.card_h)
+
+    def paint(self, painter: QPainter, option, index):  # type: ignore[override]
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+        rect = option.rect.adjusted(4, 4, -4, -4)
+        selection_mode = bool(index.data(ROLE_SELECTION_MODE))
+        selected = bool(index.data(ROLE_SELECTED)) and selection_mode
+        active = bool(index.data(ROLE_ACTIVE))
+        hovered = bool(option.state & QStyle.State_MouseOver)
+
+        bg_color = QColor(255, 255, 255, 6)
+        border_color = QColor(0, 0, 0, 0)
+        if selected:
+            border_color = QColor(61, 174, 233)
+            bg_color = QColor(61, 174, 233, 30)
+        elif active:
+            border_color = QColor(241, 196, 15)
+            bg_color = QColor(241, 196, 15, 24)
+        elif hovered:
+            border_color = QColor(100, 100, 100)
+            bg_color = QColor(255, 255, 255, 10)
+
+        painter.setBrush(bg_color)
+        painter.setPen(border_color)
+        painter.drawRoundedRect(rect, 8, 8)
+
+        img_rect = QRect(rect.left() + self.pad, rect.top() + self.pad, self.img_w, self.img_h)
+        painter.setBrush(QColor(34, 34, 34))
+        painter.setPen(QColor(68, 68, 68))
+        painter.drawRoundedRect(img_rect, 6, 6)
+
+        pix = index.data(ROLE_PREVIEW_PIXMAP)
+        if isinstance(pix, QPixmap) and not pix.isNull():
+            painter.drawPixmap(img_rect, pix, pix.rect())
+        else:
+            painter.setPen(QColor(120, 120, 120))
+            painter.drawText(img_rect, Qt.AlignCenter, "No Preview")
+
+        scene_name = index.data(ROLE_SCENE) or ""
+        var_name = index.data(ROLE_VAR) or ""
+        text_rect = QRect(rect.left() + self.pad, img_rect.bottom() + 8, rect.width() - self.pad * 2, 40)
+
+        painter.setPen(QColor(230, 230, 230))
+        fm = QFontMetrics(painter.font())
+        scene_elide = fm.elidedText(str(scene_name), Qt.ElideRight, text_rect.width())
+        painter.drawText(text_rect, Qt.AlignTop | Qt.AlignLeft, scene_elide)
+
+        painter.setPen(QColor(160, 160, 160))
+        small_rect = QRect(text_rect.left(), text_rect.top() + 18, text_rect.width(), 20)
+        var_elide = fm.elidedText(str(var_name), Qt.ElideRight, small_rect.width())
+        painter.drawText(small_rect, Qt.AlignLeft | Qt.AlignTop, var_elide)
+
+        painter.restore()
+
 def _var_signature(p: Path) -> str:
     try:
         st = p.stat()
@@ -326,6 +656,99 @@ def _file_signature(p: Path) -> str:
 # ======================
 # VaM-like helpers
 # ======================
+def fast_list_vars(addon_dir: Path) -> list[Path]:
+    """
+    Faster than Path.glob('*.var') for huge folders.
+    Returns list of Path for *.var only (enabled), including subfolders.
+    """
+    out: list[Path] = []
+    seen: set[str] = set()
+    try:
+        has_dirs = False
+        with os.scandir(addon_dir) as it:
+            for e in it:
+                if e.is_dir():
+                    has_dirs = True
+                    continue
+                if not e.is_file():
+                    continue
+                name = e.name
+                if name.lower().endswith(".var"):
+                    if e.path not in seen:
+                        seen.add(e.path)
+                        out.append(Path(e.path))
+        if has_dirs:
+            for root, _dirs, files in os.walk(addon_dir):
+                for fname in files:
+                    low = fname.lower()
+                    if not low.endswith(".var"):
+                        continue
+                    fp = os.path.join(root, fname)
+                    if fp in seen:
+                        continue
+                    seen.add(fp)
+                    out.append(Path(fp))
+    except Exception:
+        # fallback
+        out = list(addon_dir.rglob("*.var"))
+    return out
+
+def fast_list_vars_all_states(addon_dir: Path) -> list[tuple[str, Path]]:
+    """
+    Returns list of (orig_var_name, actual_path) for:
+    - *.var
+    - *.var.disabled  -> normalized to orig *.var name
+    """
+    out: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    try:
+        has_dirs = False
+        with os.scandir(addon_dir) as it:
+            for e in it:
+                if e.is_dir():
+                    has_dirs = True
+                    continue
+                if not e.is_file():
+                    continue
+                name = e.name
+                low = name.lower()
+                if low.endswith(".var"):
+                    if e.path not in seen:
+                        seen.add(e.path)
+                        out.append((name, Path(e.path)))
+                elif low.endswith(".var.disabled"):
+                    orig = name[:-len(DISABLED_SUFFIX)]  # strip ".disabled"
+                    if e.path not in seen:
+                        seen.add(e.path)
+                        out.append((orig, Path(e.path)))
+        if has_dirs:
+            for root, _dirs, files in os.walk(addon_dir):
+                for fname in files:
+                    low = fname.lower()
+                    if low.endswith(".var"):
+                        fp = os.path.join(root, fname)
+                        if fp in seen:
+                            continue
+                        seen.add(fp)
+                        out.append((fname, Path(fp)))
+                    elif low.endswith(".var.disabled"):
+                        fp = os.path.join(root, fname)
+                        if fp in seen:
+                            continue
+                        seen.add(fp)
+                        orig = fname[:-len(DISABLED_SUFFIX)]
+                        out.append((orig, Path(fp)))
+    except Exception:
+        # fallback (slower)
+        for p in addon_dir.rglob("*.var"):
+            out.append((p.name, p))
+        for p in addon_dir.rglob("*.var.disabled"):
+            orig = p.name[:-len(DISABLED_SUFFIX)]
+            out.append((orig, p))
+    return out
+
+
+
 def _parse_var_base_and_version(var_filename: str) -> tuple[str, str]:
     name = var_filename
     if name.lower().endswith(".var"):
@@ -621,72 +1044,141 @@ class AnalyzeWorker(QThread):
         self.old_cache = old_cache or {}
 
     def run(self):
-        all_var_files = list(self.addon_dir.glob("*.var"))
-        total_var_count = len(all_var_files)
+        var_items = fast_list_vars_all_states(self.addon_dir)  # [(orig_name, actual_path)]
+        total_var_count = len([1 for (n, p) in var_items if str(p).lower().endswith(".var")])  # optional: count enabled only
+        show_hidden = True
 
-        all_var_names = [p.name for p in all_var_files]
-        allowed_var_names = _choose_latest_vars(all_var_names)
-
-        show_hidden = False
+        # Build path map (prefer enabled .var over .var.disabled)
+        var_paths: dict[str, str] = {}
+        for name, actual_path in var_items:
+            rel = ""
+            try:
+                rel = str(actual_path.relative_to(self.addon_dir)).replace("\\", "/")
+            except Exception:
+                rel = str(actual_path)
+            existing = var_paths.get(name)
+            if not existing:
+                var_paths[name] = rel
+            else:
+                if actual_path.name.lower().endswith(".var"):
+                    var_paths[name] = rel
 
         old_vars = (self.old_cache.get("vars") or {}) if isinstance(self.old_cache, dict) else {}
         old_loose = (self.old_cache.get("loose") or {}) if isinstance(self.old_cache, dict) else {}
 
-        new_vars: dict[str, dict] = {}
+        all_infos: dict[str, dict] = {}
+        all_sigs: dict[str, str] = {}
         new_loose: dict[str, dict] = {}
 
         scene_entries: list[dict] = []
 
-        for p in all_var_files:
-            name = p.name
-            if name not in allowed_var_names:
-                continue
+        # 3) Thread count (reasonable)
+        max_workers = min(16, (os.cpu_count() or 8) * 2)
 
-            sig = _var_signature(p)
+        # 4) Parallel scan meta.json for non-cached vars
+        futures = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for orig_name, actual_path in var_items:
+                name = orig_name
+                sig = _var_signature(actual_path)
+                all_sigs[name] = sig
 
-            cached = old_vars.get(name) if isinstance(old_vars, dict) else None
-            if isinstance(cached, dict) and cached.get("sig") == sig:
-                scenes = cached.get("scenes", [])
-                if isinstance(scenes, list):
-                    for s in scenes:
-                        if not isinstance(s, dict):
-                            continue
-                        scene_entries.append({
-                            "source": "var",
-                            "scene_name": s.get("scene_name", ""),
-                            "var_name": name,
-                            "preview_relpath": s.get("preview_relpath", ""),
-                            "loose_relpath": "",
-                            "is_girl_looks": None,
-                        })
-                new_vars[name] = cached
-                continue
+                cached = old_vars.get(name) if isinstance(old_vars, dict) else None
+                if isinstance(cached, dict) and cached.get("sig") == sig:
+                    if "dependencies" not in cached:
+                        cached["dependencies"] = []
+                    all_infos[name] = cached
+                    continue
 
-            info = scan_var(p)
-            scenes_out = []
+                futures[ex.submit(scan_var_meta_only, actual_path)] = (name, actual_path, sig)
 
-            if info.get("has_scene"):
-                for scene in info.get("scenes", []):
-                    scene_name = scene.get("scene_name", "")
-                    image_bytes = scene.get("image_bytes", None)
-                    rel = write_preview_bytes(name, scene_name, image_bytes)
+            # 5) Collect results
+            for fut in as_completed(futures):
+                name, actual_path, sig = futures[fut]
+
+                try:
+                    info = fut.result()
+                except Exception:
+                    info = {}
+
+                scenes_out = []
+                for scene in (info.get("scenes") or []):
+                    if not isinstance(scene, dict):
+                        continue
+                    scene_name = scene.get("scene_name", "") or ""
+                    preview_inner = scene.get("preview_path", "") or ""
+                    scene_inner = scene.get("scene_path", "") or ""
 
                     scenes_out.append({
                         "scene_name": scene_name,
-                        "preview_relpath": rel,
+                        "preview_relpath": "",
+                        "preview_inner": preview_inner, # IMPORTANT
+                        "scene_path": scene_inner,  # for looks detection
                     })
 
+                deps = info.get("dependencies", [])
+                if not isinstance(deps, list):
+                    deps = []
+                all_infos[name] = {"sig": sig, "scenes": scenes_out, "dependencies": deps}
+
+        # choose one var per base: highest version that contains scenes (fallback to highest)
+        by_base: dict[str, list[str]] = {}
+        for name in all_infos.keys():
+            base, _ver = _parse_var_base_and_version(name)
+            by_base.setdefault(base, []).append(name)
+
+        def _version_key(nm: str) -> tuple[int, str, str]:
+            _b, v = _parse_var_base_and_version(nm)
+            try:
+                vnum = int(v)
+            except Exception:
+                vnum = -1
+            return (vnum, v, nm)
+
+        selected_names: set[str] = set()
+        for base, names in by_base.items():
+            ordered = sorted(names, key=_version_key, reverse=True)
+            chosen = None
+            for nm in ordered:
+                info = all_infos.get(nm) or {}
+                if info.get("scenes"):
+                    chosen = nm
+                    break
+            if not chosen and ordered:
+                chosen = ordered[0]
+            if chosen:
+                selected_names.add(chosen)
+
+        new_vars: dict[str, dict] = {}
+        for name in selected_names:
+            info = all_infos.get(name) or {}
+            new_vars[name] = info
+            scenes = info.get("scenes", [])
+            if isinstance(scenes, list):
+                for s in scenes:
+                    if not isinstance(s, dict):
+                        continue
                     scene_entries.append({
                         "source": "var",
-                        "scene_name": scene_name,
+                        "scene_name": s.get("scene_name", ""),
                         "var_name": name,
-                        "preview_relpath": rel,
+                        "preview_relpath": s.get("preview_relpath", ""),
+                        "preview_inner": s.get("preview_inner", ""),  # IMPORTANT
+                        "scene_path": s.get("scene_path", ""),  # for looks detection
                         "loose_relpath": "",
                         "is_girl_looks": None,
                     })
 
-            new_vars[name] = {"sig": sig, "scenes": scenes_out}
+        all_deps: dict[str, list[str]] = {}
+        for name, info in all_infos.items():
+            if not isinstance(name, str) or not isinstance(info, dict):
+                continue
+            deps = info.get("dependencies", [])
+            if not isinstance(deps, list):
+                continue
+            all_deps[name] = [d for d in deps if isinstance(d, str)]
 
+        # 6) Loose scenes (Saves/scene folder) - keep like before (this part is not heavy)
         if self.saves_scene_dir and self.saves_scene_dir.exists():
             for sp in self.saves_scene_dir.rglob("*.json"):
                 if (not show_hidden) and _is_hidden_sidecar(sp):
@@ -710,6 +1202,8 @@ class AnalyzeWorker(QThread):
                         "scene_name": scene_name,
                         "var_name": "(Saves/scene)",
                         "preview_relpath": "",
+                        "preview_inner": "",  # IMPORTANT
+                        "scene_path": "",
                         "loose_relpath": relp,
                         "is_girl_looks": None,
                     })
@@ -722,23 +1216,280 @@ class AnalyzeWorker(QThread):
                     "scene_name": scene_name,
                     "var_name": "(Saves/scene)",
                     "preview_relpath": "",
+                    "preview_inner": "",  # IMPORTANT
+                    "scene_path": "",
                     "loose_relpath": relp,
                     "is_girl_looks": None,
                 })
                 new_loose[relp] = {"sig": sig, "scene_name": scene_name}
 
+        # 7) Build cache object
         cache_obj = {
-            "version": 3,
+            "version": 13,  # bump to 13 (scene_path added)
             "addon_dir": str(self.addon_dir),
             "vars": new_vars,
+            "all_var_sigs": all_sigs,
+            "var_paths": var_paths,
+            "all_deps": all_deps,
             "loose": new_loose,
             "looks": self.old_cache.get("looks", {}) if isinstance(self.old_cache, dict) else {},
             "saved_at": time.time(),
             "only_latest_always": True,
-            "show_hidden_always": False,
+            "show_hidden_always": True,
         }
 
         self.finished.emit(scene_entries, total_var_count, cache_obj)
+
+
+# ======================
+# UnusedCountWorker
+# ======================
+class UnusedCountWorker(QThread):
+    finished = Signal(int)  # unused_count
+
+    def __init__(self, addon_dir: Path, scene_vars: set[str], deps_map: dict[str, list[str]] | None = None):
+        super().__init__()
+        self.addon_dir = addon_dir
+        self.scene_vars = set(scene_vars)
+        self.deps_map = deps_map or {}
+
+    def _deps_for(self, var_name: str, path: Path | None) -> list[str]:
+        deps = self.deps_map.get(var_name)
+        if isinstance(deps, list):
+            return [d for d in deps if isinstance(d, str)]
+        if path:
+            info = scan_var_meta_only(path)
+            deps = info.get("dependencies", [])
+            if isinstance(deps, list):
+                return [d for d in deps if isinstance(d, str)]
+        return []
+
+    def run(self):
+        try:
+            var_items = fast_list_vars_all_states(self.addon_dir)
+
+            var_paths: dict[str, Path] = {}
+            enabled_vars: set[str] = set()
+            for name, actual_path in var_items:
+                if actual_path.name.lower().endswith(".var"):
+                    enabled_vars.add(name)
+                    var_paths[name] = actual_path
+                else:
+                    if name not in var_paths:
+                        var_paths[name] = actual_path
+
+            all_vars = set(var_paths.keys())
+            protected = {v for v in all_vars if is_asset_var(v)}
+            protected |= {v for v in all_vars if "[plugin]" in v.lower()}
+
+            keep = set(protected)
+            queue: list[str] = []
+
+            for scene_var in self.scene_vars:
+                if scene_var in all_vars:
+                    keep.add(scene_var)
+                    queue.extend(self._deps_for(scene_var, var_paths.get(scene_var)))
+
+            while queue:
+                dep = queue.pop()
+                for matched_var in resolve_dependency(dep, all_vars):
+                    if matched_var not in keep:
+                        keep.add(matched_var)
+                        queue.extend(self._deps_for(matched_var, var_paths.get(matched_var)))
+
+            unused = enabled_vars - keep
+            self.finished.emit(len(unused))
+        except Exception:
+            self.finished.emit(0)
+
+
+# ======================
+# CacheSaveWorker
+# ======================
+class CacheSaveWorker(QThread):
+    def __init__(self, cache_obj: dict):
+        super().__init__()
+        self.cache_obj = cache_obj
+
+    def run(self):
+        try:
+            cache_path().write_text(
+                json.dumps(self.cache_obj, separators=(",", ":"), ensure_ascii=True),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+
+# ======================
+# PreviewLoader (background)
+# ======================
+class PreviewLoader(QThread):
+    result = Signal(object)  # dict with preview payload
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._queue: PriorityQueue = PriorityQueue()
+        self._counter = itertools.count()
+        self._stop = False
+        self._max_queue = 20000
+        self._zip_cache: dict[str, zipfile.ZipFile] = {}
+        self._zip_order = deque()
+        self._zip_cache_limit = 32
+
+    def enqueue(self, task: dict, priority: int = 0) -> bool:
+        if self._stop:
+            return False
+        try:
+            if self._queue.qsize() >= self._max_queue:
+                return False
+            self._queue.put_nowait((int(priority), next(self._counter), task))
+            return True
+        except Exception:
+            return False
+
+    def stop(self):
+        self._stop = True
+        try:
+            self._queue.put_nowait((0, next(self._counter), None))
+        except Exception:
+            pass
+        try:
+            for z in self._zip_cache.values():
+                try:
+                    z.close()
+                except Exception:
+                    pass
+            self._zip_cache.clear()
+            self._zip_order.clear()
+        except Exception:
+            pass
+
+    def _get_zip(self, var_path: Path) -> zipfile.ZipFile | None:
+        key = str(var_path)
+        z = self._zip_cache.get(key)
+        if z is not None:
+            if key in self._zip_order:
+                try:
+                    self._zip_order.remove(key)
+                except Exception:
+                    pass
+            self._zip_order.append(key)
+            return z
+        try:
+            z = zipfile.ZipFile(var_path, "r")
+        except Exception:
+            return None
+        self._zip_cache[key] = z
+        self._zip_order.append(key)
+        if len(self._zip_order) > self._zip_cache_limit:
+            old_key = self._zip_order.popleft()
+            old = self._zip_cache.pop(old_key, None)
+            if old:
+                try:
+                    old.close()
+                except Exception:
+                    pass
+        return z
+
+    def _read_preview_from_var_cached(self, var_path: Path, scene_name: str, inner_hint: str) -> tuple[bytes | None, str]:
+        z = self._get_zip(var_path)
+        if not z:
+            return None, ""
+        if inner_hint:
+            try:
+                return z.read(inner_hint), inner_hint
+            except Exception:
+                pass
+        for ext in (".png", ".jpg", ".jpeg"):
+            cand = f"Saves/scene/{scene_name}{ext}"
+            try:
+                return z.read(cand), cand
+            except Exception:
+                pass
+        base = scene_name.lower()
+        try:
+            for name in z.namelist():
+                ln = name.lower()
+                if not ln.startswith("saves/scene/"):
+                    continue
+                if not (ln.endswith(".png") or ln.endswith(".jpg") or ln.endswith(".jpeg")):
+                    continue
+                if Path(ln).stem == base:
+                    try:
+                        return z.read(name), name
+                    except Exception:
+                        pass
+        except Exception:
+            return None, ""
+        return None, ""
+
+    def _make_thumb_bytes(self, image_bytes: bytes, width: int, height: int) -> bytes | None:
+        if not image_bytes or width <= 0 or height <= 0:
+            return None
+        img = QImage.fromData(image_bytes)
+        if img.isNull():
+            return None
+        thumb = img.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        buf = QBuffer()
+        buf.open(QBuffer.WriteOnly)
+        ok = thumb.save(buf, "JPG", 85)
+        if not ok:
+            return None
+        return bytes(buf.data())
+
+    def run(self):
+        while True:
+            _pri, _seq, task = self._queue.get()
+            if task is None:
+                return
+            if self._stop:
+                return
+
+            row = task.get("row", -1)
+            gen = task.get("gen", 0)
+            var_name = task.get("var_name", "")
+            scene_name = task.get("scene_name", "")
+            preview_rel = task.get("preview_rel", "") or ""
+            preview_inner = task.get("preview_inner", "") or ""
+            var_path = task.get("var_path")
+            cache_only = bool(task.get("cache_only", False))
+            cache_to_disk = bool(task.get("cache_to_disk", True))
+            thumb_w = int(task.get("thumb_w", 0) or 0)
+            thumb_h = int(task.get("thumb_h", 0) or 0)
+
+            img_bytes = None
+            rel_used = ""
+            inner_used = preview_inner
+
+            # Try cache path first (even if preview_rel missing)
+            rel_try = preview_rel
+            if not rel_try and var_name and scene_name:
+                rel_try = f"previews/{_safe_preview_key(var_name, scene_name)}.bin"
+            if rel_try:
+                img_bytes = read_preview_bytes(rel_try)
+                if img_bytes:
+                    rel_used = rel_try
+
+            # Fallback: read from var zip
+            if img_bytes is None and isinstance(var_path, Path):
+                img_bytes, inner_used = self._read_preview_from_var_cached(var_path, scene_name, preview_inner)
+                if img_bytes and cache_to_disk:
+                    thumb_bytes = self._make_thumb_bytes(img_bytes, thumb_w, thumb_h) if (thumb_w and thumb_h) else None
+                    rel_used = write_preview_bytes(var_name, scene_name, thumb_bytes or img_bytes)
+                    if thumb_bytes:
+                        img_bytes = thumb_bytes
+
+            self.result.emit({
+                "row": row,
+                "gen": gen,
+                "var_name": var_name,
+                "scene_name": scene_name,
+                "bytes": img_bytes,
+                "preview_rel": rel_used,
+                "preview_inner": inner_used or "",
+                "cache_only": cache_only,
+            })
 
 
 # ======================
@@ -767,27 +1518,26 @@ class ChangeCheckWorker(QThread):
             cached_vars = self.cache_obj.get("vars", {}) if isinstance(self.cache_obj.get("vars"), dict) else {}
             cached_loose = self.cache_obj.get("loose", {}) if isinstance(self.cache_obj.get("loose"), dict) else {}
 
-            all_var_files = list(self.addon_dir.glob("*.var"))
-            all_var_names = [p.name for p in all_var_files]
-            allowed_now = _choose_latest_vars(all_var_names)
-
-            if set(cached_vars.keys()) != set(allowed_now):
+            cached_all = self.cache_obj.get("all_var_sigs")
+            if not isinstance(cached_all, dict):
                 self.finished.emit(True)
                 return
 
-            by_name = {p.name: p for p in all_var_files}
-            for name in allowed_now:
-                p = by_name.get(name)
-                if not p:
-                    self.finished.emit(True)
-                    return
-                sig_now = _var_signature(p)
-                sig_cached = (cached_vars.get(name) or {}).get("sig")
-                if sig_now != sig_cached:
+            var_items = fast_list_vars_all_states(self.addon_dir)
+            current_sigs: dict[str, str] = {}
+            for name, actual_path in var_items:
+                current_sigs[name] = _var_signature(actual_path)
+
+            if set(current_sigs.keys()) != set(cached_all.keys()):
+                self.finished.emit(True)
+                return
+
+            for name, sig_now in current_sigs.items():
+                if cached_all.get(name) != sig_now:
                     self.finished.emit(True)
                     return
 
-            show_hidden = False
+            show_hidden = True
             loose_now: dict[str, str] = {}
             if self.saves_scene_dir and self.saves_scene_dir.exists():
                 for sp in self.saves_scene_dir.rglob("*.json"):
@@ -822,7 +1572,7 @@ class ChangeCheckWorker(QThread):
 class LooksWorker(QThread):
     finished = Signal(dict)  # looks_map { "var::scene": bool }
 
-    def __init__(self, addon_dir: Path, scene_pairs: list[tuple[str, str]], existing: dict):
+    def __init__(self, addon_dir: Path, scene_pairs: list[tuple[str, str, str]], existing: dict):
         super().__init__()
         self.addon_dir = addon_dir
         self.scene_pairs = scene_pairs
@@ -833,47 +1583,76 @@ class LooksWorker(QThread):
         return f"{var_name}::{scene_name}"
 
     @staticmethod
-    def _detect_looks_in_var(var_path: Path, scene_name: str) -> bool:
-        wanted = f"{scene_name}.json".lower()
+    def _detect_looks_in_zip(z: zipfile.ZipFile, scene_name: str, scene_path: str, json_map: dict[str, str]) -> bool:
+        target = ""
+        if scene_path:
+            target = scene_path
+        else:
+            key = scene_name.lower()
+            target = json_map.get(key, "")
 
-        # NEW: fallback to .disabled
-        if not var_path.exists():
-            alt = Path(str(var_path) + DISABLED_SUFFIX)
-            if alt.exists():
-                var_path = alt
+        if not target:
+            return False
 
         try:
-            with zipfile.ZipFile(var_path, "r") as z:
-                target = None
-                for n in z.namelist():
-                    ln = n.lower().replace("\\", "/")
-                    if not ln.endswith(".json"):
-                        continue
-                    if "saves/scene/" not in ln:
-                        continue
-                    if Path(ln).name == wanted:
-                        target = n
-                        break
-                if not target:
-                    return False
-
-                raw = z.read(target)
-                txt = raw.decode("utf-8", errors="ignore").lower()
-                return ("/female" in txt) and ("/male" not in txt)
+            raw = z.read(target)
         except Exception:
             return False
+
+        try:
+            blob = raw.lower()
+        except Exception:
+            try:
+                blob = raw.decode("utf-8", errors="ignore").lower().encode("utf-8", errors="ignore")
+            except Exception:
+                return False
+
+        return (b"/female" in blob) and (b"/male" not in blob)
 
 
     def run(self):
         out = dict(self.existing) if isinstance(self.existing, dict) else {}
-        for var_name, scene_name in self.scene_pairs:
-            k = self._key(var_name, scene_name)
-            if k in out:
-                continue
+        by_var: dict[str, list[tuple[str, str]]] = {}
+        for var_name, scene_name, scene_path in self.scene_pairs:
+            by_var.setdefault(var_name, []).append((scene_name, scene_path))
+
+        for var_name, scenes in by_var.items():
+            var_path = self.addon_dir / var_name
+            if not var_path.exists():
+                alt = Path(str(var_path) + DISABLED_SUFFIX)
+                if alt.exists():
+                    var_path = alt
+
             try:
-                out[k] = self._detect_looks_in_var(self.addon_dir / var_name, scene_name)
+                with zipfile.ZipFile(var_path, "r") as z:
+                    json_map: dict[str, str] = {}
+                    try:
+                        for name in z.namelist():
+                            ln = name.lower().replace("\\", "/")
+                            if not ln.startswith("saves/scene/"):
+                                continue
+                            if not ln.endswith(".json"):
+                                continue
+                            stem = Path(ln).stem
+                            if stem not in json_map:
+                                json_map[stem] = name
+                    except Exception:
+                        json_map = {}
+
+                    for scene_name, scene_path in scenes:
+                        k = self._key(var_name, scene_name)
+                        if k in out:
+                            continue
+                        try:
+                            out[k] = self._detect_looks_in_zip(z, scene_name, scene_path, json_map)
+                        except Exception:
+                            out[k] = False
             except Exception:
-                out[k] = False
+                for scene_name, _scene_path in scenes:
+                    k = self._key(var_name, scene_name)
+                    if k not in out:
+                        out[k] = False
+
         self.finished.emit(out)
 
 
@@ -899,7 +1678,7 @@ class DependencyRow(QWidget):
         label = QLabel(text)
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        label.setStyleSheet("color: #ddd;")
+        label.setStyleSheet("color: #9be28c;" if present else "color: #ff8b8b;")
         layout.addWidget(label, 1)
 
         self.setLayout(layout)
@@ -1038,13 +1817,47 @@ class MainWindow(QWidget):
 
         self.selected_scene_vars: set[str] = set()
 
-        self.cards: list[SceneCard] = []
-        self.card_by_var: dict[str, list[SceneCard]] = {}
+        self.scene_model = SceneListModel(self)
+        self.scene_proxy = SceneFilterProxy(self)
+        self.scene_proxy.setSourceModel(self.scene_model)
+        self.scene_proxy.setDynamicSortFilter(True)
+        self._var_path_cache: dict[str, Path] = {}
+        self._var_path_cache_ready = False
+        self._var_deps_cache: dict[str, list[str]] = {}
+        self._unused_worker: UnusedCountWorker | None = None
+        self._unused_req_id = 0
+        self._cache_save_worker: CacheSaveWorker | None = None
+        self._preview_loaders: list[PreviewLoader] = []
+        self._preview_loader_index = 0
+        self._preview_pending: set[int] = set()
+        self._preview_gen = 0
+        self._preview_cache_order = deque()
+        self._preview_cached_rows: set[int] = set()
+        self._preview_cache_limit = 1800
+        self._visible_rows_cache: set[int] = set()
+        self._preload_rows: list[int] = []
+        self._preload_index = 0
+        self._preload_timer = QTimer(self)
+        self._preload_timer.setInterval(10)
+        self._preload_timer.timeout.connect(self._preload_all_tick)
+        self._auto_preload_previews = True
+        self._preload_status_base = ""
+        self._preload_full_cache_active = False
+        self._preview_schedule_timer = QTimer(self)
+        self._preview_schedule_timer.setSingleShot(True)
+        self._preview_schedule_timer.setInterval(60)
+        self._preview_schedule_timer.timeout.connect(self._enqueue_visible_previews)
 
         self.total_vars_count = 0
         self.unused_vars_count = 0
         self.scene_entries: list[dict] = []
         self.total_scene_files_found = 0
+        self.page_size = 4000
+        self.page_index = 0
+        self._filtered_entries: list[dict] = []
+        self._total_pages = 1
+        self.use_pagination = False
+        self._thumb_target = QSize(180, 120)
 
         #apply button variable
         self.session_baseline_scene_vars: set[str] = set()
@@ -1074,7 +1887,7 @@ class MainWindow(QWidget):
         self._resize_timer = QTimer(self)
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(100)
-        self._resize_timer.timeout.connect(lambda: self.apply_filter(self.search.text()))
+        self._resize_timer.timeout.connect(self._update_scene_view_grid)
 
                 # drag-to-scroll (touch-like)
         self._drag_scroll_active = False
@@ -1310,6 +2123,36 @@ class MainWindow(QWidget):
         row_search.addWidget(self.search, 1)
         self.left_layout.addLayout(row_search)
 
+        self.page_controls = QWidget()
+        row_page = QHBoxLayout(self.page_controls)
+        row_page.setContentsMargins(0, 0, 0, 0)
+        row_page.setSpacing(8)
+
+        self.btn_page_prev = QPushButton("Prev")
+        self.btn_page_prev.setEnabled(False)
+        self.btn_page_prev.setStyleSheet(self._btn_css)
+        self.btn_page_prev.clicked.connect(lambda: self._change_page(-1))
+        row_page.addWidget(self.btn_page_prev)
+
+        self.page_label = QLabel("Page 1/1")
+        self._set_dim_label(self.page_label, "#aaa")
+        row_page.addWidget(self.page_label)
+
+        self.btn_page_next = QPushButton("Next")
+        self.btn_page_next.setEnabled(False)
+        self.btn_page_next.setStyleSheet(self._btn_css)
+        self.btn_page_next.clicked.connect(lambda: self._change_page(1))
+        row_page.addWidget(self.btn_page_next)
+
+        row_page.addStretch(1)
+
+        self.page_size_label = QLabel(f"Page size: {self.page_size}")
+        self._set_dim_label(self.page_size_label, "#777")
+        row_page.addWidget(self.page_size_label)
+
+        self.page_controls.setVisible(self.use_pagination)
+        self.left_layout.addWidget(self.page_controls)
+
         self.card_header = QWidget()
         self.card_header.setStyleSheet("""
             QWidget {
@@ -1334,6 +2177,12 @@ class MainWindow(QWidget):
         self.btn_clear_sel.setStyleSheet(self._btn_css)
         header_layout.addWidget(self.btn_clear_sel)
 
+        self.btn_preload_previews = QPushButton("Preload Previews")
+        self.btn_preload_previews.setEnabled(False)
+        self.btn_preload_previews.clicked.connect(self._on_preload_previews_clicked)
+        self.btn_preload_previews.setStyleSheet(self._btn_css)
+        header_layout.addWidget(self.btn_preload_previews)
+
         header_layout.addStretch(1)
 
         self.chk_girl_looks_only = QCheckBox('Show Girl "Looks" Only')
@@ -1343,25 +2192,30 @@ class MainWindow(QWidget):
 
         self.left_layout.addWidget(self.card_header)
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setStyleSheet(build_scrollbar_css(self._dark))
+        self.scene_view = QListView()
+        self.scene_view.setViewMode(QListView.IconMode)
+        self.scene_view.setResizeMode(QListView.Adjust)
+        self.scene_view.setMovement(QListView.Static)
+        self.scene_view.setWrapping(True)
+        self.scene_view.setFlow(QListView.LeftToRight)
+        self.scene_view.setSpacing(10)
+        self.scene_view.setUniformItemSizes(True)
+        self.scene_view.setLayoutMode(QListView.Batched)
+        self.scene_view.setBatchSize(200)
+        self.scene_view.setSelectionMode(QListView.NoSelection)
+        self.scene_view.setViewportMargins(0, 0, 0, 0)
+        self.scene_view.setStyleSheet(build_scrollbar_css(self._dark))
+        self.scene_delegate = SceneDelegate(self.scene_view)
+        self.scene_view.setItemDelegate(self.scene_delegate)
+        self.scene_view.setModel(self.scene_model)
+        self.scene_view.setMouseTracking(True)
+        self.scene_view.clicked.connect(self.on_scene_clicked)
+        self.scene_view.viewport().installEventFilter(self)
+        self.scene_view.verticalScrollBar().valueChanged.connect(self._schedule_visible_previews)
 
-        self.scroll.viewport().installEventFilter(self)
-
-        self.scene_container = QWidget()
-        self.scene_container_layout = QVBoxLayout(self.scene_container)
-        self.scene_container_layout.setContentsMargins(10, 10, 10, 10)
-        self.scene_container_layout.setSpacing(8)
-
-        self.grid_holder = QWidget()
-        self.scene_grid = QGridLayout(self.grid_holder)
-        self.scene_grid.setSpacing(10)
-        self.scene_grid.setContentsMargins(0, 0, 0, 0)
-
-        self.scene_container_layout.addWidget(self.grid_holder, 1)
-        self.scroll.setWidget(self.scene_container)
-        self.left_layout.addWidget(self.scroll, 1)
+        self._update_scene_view_grid()
+        self._ensure_preview_loader()
+        self.left_layout.addWidget(self.scene_view, 1)
 
         # ------------------
         # RIGHT
@@ -1448,13 +2302,12 @@ class MainWindow(QWidget):
 
     def _begin_batch_selection(self):
         self._batch_selection = True
-        self.scene_container.setUpdatesEnabled(False)
+        self.scene_view.setUpdatesEnabled(False)
 
     def _end_batch_selection(self):
         self._batch_selection = False
-        self.scene_container.setUpdatesEnabled(True)
+        self.scene_view.setUpdatesEnabled(True)
         # do heavy UI only once
-        self.apply_filter(self.search.text())
         self.update_selection_ui()
         self._check_selection_dirty()
 
@@ -1535,18 +2388,7 @@ class MainWindow(QWidget):
         if not self.addon_dir:
             return set()
 
-        out: set[str] = set()
-
-        # enabled
-        for p in self.addon_dir.glob("*.var"):
-            out.add(p.name)
-
-        # disabled -> normalize back to .var
-        for p in self.addon_dir.glob("*.var.disabled"):
-            orig = p.name[:-len(DISABLED_SUFFIX)]
-            out.add(orig)
-
-        return out
+        return {name for (name, _p) in fast_list_vars_all_states(self.addon_dir)}
 
 
     # ======================
@@ -1666,7 +2508,7 @@ class MainWindow(QWidget):
 
     
     def eventFilter(self, obj, event):
-        if obj == self.scroll.viewport():
+        if obj == self.scene_view.viewport():
             et = event.type()
 
             # keep your resize behavior
@@ -1674,16 +2516,11 @@ class MainWindow(QWidget):
                 self._resize_timer.start()
                 return False
 
-            # --- drag-to-scroll (like phone) ---
-            if et == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
-                # don't steal clicks from interactive widgets (cards/buttons etc.)
-                child = obj.childAt(event.pos())
-                if child and (isinstance(child, QPushButton) or isinstance(child, QCheckBox) or isinstance(child, QLineEdit) or isinstance(child, QComboBox)):
-                    return False
-
+            # --- drag-to-scroll (middle mouse) ---
+            if et == QEvent.MouseButtonPress and event.button() == Qt.MiddleButton:
                 self._drag_scroll_active = True
                 self._drag_scroll_start_pos = event.globalPosition().toPoint()
-                self._drag_scroll_start_value = self.scroll.verticalScrollBar().value()
+                self._drag_scroll_start_value = self.scene_view.verticalScrollBar().value()
                 obj.setCursor(Qt.ClosedHandCursor)
                 event.accept()
                 return True
@@ -1692,7 +2529,7 @@ class MainWindow(QWidget):
                 cur = event.globalPosition().toPoint()
                 dy = cur.y() - self._drag_scroll_start_pos.y()
                 # invert so drag down scrolls down (natural touch feel)
-                self.scroll.verticalScrollBar().setValue(self._drag_scroll_start_value - dy)
+                self.scene_view.verticalScrollBar().setValue(self._drag_scroll_start_value - dy)
                 event.accept()
                 return True
 
@@ -1706,12 +2543,21 @@ class MainWindow(QWidget):
         return super().eventFilter(obj, event)
 
 
-    def _calc_max_cols(self) -> int:
-        card_w = 220
-        spacing = self.scene_grid.spacing()
-        avail = max(1, self.scroll.viewport().width() - 20)
-        cols = (avail + spacing) // (card_w + spacing)
-        return max(1, int(cols))
+    def _update_scene_view_grid(self):
+        if not hasattr(self, "scene_delegate"):
+            return
+        spacing = self.scene_view.spacing()
+        avail = max(1, self.scene_view.viewport().width())
+        min_card_w = 170
+        cols = max(1, (avail + spacing) // (min_card_w + spacing))
+        card_w = int((avail - spacing * (cols - 1)) / cols)
+
+        self.scene_delegate.set_card_width(card_w)
+        grid_w = card_w
+        grid_h = self.scene_delegate.card_h
+        self.scene_view.setGridSize(QSize(grid_w, grid_h))
+        self.scene_view.doItemsLayout()
+        self._schedule_visible_previews()
 
     def is_selection_mode(self) -> bool:
         return self.chk_select_mode.isChecked()
@@ -1794,13 +2640,40 @@ class MainWindow(QWidget):
         """
         if not self.addon_dir:
             return None
+        if not self._var_path_cache_ready:
+            self._refresh_var_path_cache()
+        cached = self._var_path_cache.get(var_name)
+        if cached and cached.exists():
+            return cached
         p1 = self._var_enabled_path(var_name)
         if p1.exists():
+            self._var_path_cache[var_name] = p1
             return p1
         p2 = self._var_disabled_path(var_name)
         if p2.exists():
+            self._var_path_cache[var_name] = p2
             return p2
         return None
+
+    def _deps_for_var_name(self, var_name: str) -> list[str]:
+        deps = self._var_deps_cache.get(var_name)
+        if isinstance(deps, list):
+            return [d for d in deps if isinstance(d, str)]
+        p = self.get_var_existing_path(var_name)
+        if p:
+            info = scan_var_meta_only(p)
+            deps = info.get("dependencies", [])
+            if isinstance(deps, list):
+                return [d for d in deps if isinstance(d, str)]
+        return []
+
+    def _refresh_var_path_cache(self):
+        if not self.addon_dir:
+            self._var_path_cache = {}
+            self._var_path_cache_ready = False
+            return
+        self._var_path_cache = {name: path for (name, path) in fast_list_vars_all_states(self.addon_dir)}
+        self._var_path_cache_ready = True
 
     def list_var_state_map(self) -> dict[str, str]:
         """
@@ -1811,16 +2684,12 @@ class MainWindow(QWidget):
         if not self.addon_dir:
             return out
 
-        # enabled
-        for p in self.addon_dir.glob("*.var"):
-            out[p.name] = "enabled"
-
-        # disabled
-        for p in self.addon_dir.glob("*.var.disabled"):
-            orig = p.name[:-len(DISABLED_SUFFIX)]
-            # if both exist, treat enabled as truth (prefer enabled)
-            if orig not in out:
-                out[orig] = "disabled"
+        for orig_name, actual_path in fast_list_vars_all_states(self.addon_dir):
+            if actual_path.name.lower().endswith(".var"):
+                out[orig_name] = "enabled"
+            else:
+                if orig_name not in out:
+                    out[orig_name] = "disabled"
 
         return out
 
@@ -1829,7 +2698,7 @@ class MainWindow(QWidget):
         Catalog of VAR names we know about from scene scan UI.
         This does NOT depend on current file extension (.var vs .disabled).
         """
-        return set(self.card_by_var.keys())
+        return {e.get("var_name", "") for e in self.scene_entries if e.get("source") == "var" and e.get("var_name")}
 
 
     def is_vam_running(self) -> bool:
@@ -2003,9 +2872,53 @@ class MainWindow(QWidget):
 
     def _save_scene_cache(self, cache_obj: dict):
         try:
-            cache_path().write_text(json.dumps(cache_obj, indent=2), encoding="utf-8")
+            cache_path().write_text(
+                json.dumps(cache_obj, separators=(",", ":"), ensure_ascii=True),
+                encoding="utf-8",
+            )
         except Exception:
             pass
+
+    def _start_cache_save(self, cache_obj: dict):
+        self._cache_save_worker = CacheSaveWorker(cache_obj)
+        self._cache_save_worker.start()
+
+    def _set_var_path_cache_from_cache(self, cache_obj: dict):
+        if not self.addon_dir or not isinstance(cache_obj, dict):
+            return
+        rel_map = cache_obj.get("var_paths")
+        if not isinstance(rel_map, dict):
+            return
+        mapped: dict[str, Path] = {}
+        for name, rel in rel_map.items():
+            if not isinstance(name, str) or not isinstance(rel, str):
+                continue
+            mapped[name] = self.addon_dir / rel
+        self._var_path_cache = mapped
+        self._var_path_cache_ready = True
+
+    def _set_var_deps_cache_from_cache(self, cache_obj: dict):
+        self._var_deps_cache = {}
+        if not isinstance(cache_obj, dict):
+            return
+        deps_map = cache_obj.get("all_deps")
+        if isinstance(deps_map, dict):
+            for name, deps in deps_map.items():
+                if not isinstance(name, str) or not isinstance(deps, list):
+                    continue
+                self._var_deps_cache[name] = [d for d in deps if isinstance(d, str)]
+            return
+
+        vars_map = cache_obj.get("vars")
+        if not isinstance(vars_map, dict):
+            return
+        for name, info in vars_map.items():
+            if not isinstance(name, str) or not isinstance(info, dict):
+                continue
+            deps = info.get("dependencies", [])
+            if not isinstance(deps, list):
+                continue
+            self._var_deps_cache[name] = [d for d in deps if isinstance(d, str)]
 
     # ======================
     # Refresh behavior
@@ -2032,7 +2945,7 @@ class MainWindow(QWidget):
 
         cache_obj = self._load_scene_cache()
         if self._can_use_cache_for_current_folder(cache_obj):
-            if not self.cards:
+            if self.scene_model.rowCount() == 0:
                 self.looks_map = cache_obj.get("looks", {}) if isinstance(cache_obj.get("looks"), dict) else {}
                 self.scene_entries = self._scene_entries_from_cache(cache_obj)
                 self.total_scene_files_found = len(self.scene_entries)
@@ -2040,20 +2953,20 @@ class MainWindow(QWidget):
                     self.total_vars_count = len(list(self.addon_dir.glob("*.var"))) if self.addon_dir else 0
                 except Exception:
                     self.total_vars_count = 0
-                self._recompute_unused_count_from_scene_entries()
-
-                self.status.setText(f"VaM Directory:\n{self.vam_dir}\n(Loaded from cache)")
-                self.info_label.setText(
-                    f"Total VARs: {self.total_vars_count} | Unused VARs: {self.unused_vars_count} | Scenes: {self.total_scene_files_found}"
-                )
-
-                self.search.setEnabled(True)
-                self.chk_girl_looks_only.setEnabled(True)
-                self.chk_select_mode.setEnabled(True)
 
                 self.populate_scene_cards_from_entries()
                 self.apply_filter(self.search.text())
                 self.update_selection_ui()
+
+            self._set_var_path_cache_from_cache(cache_obj)
+            self._set_var_deps_cache_from_cache(cache_obj)
+            self._recompute_unused_count_from_scene_entries()
+
+            self.status.setText(f"VaM Directory:\n{self.vam_dir}\n(Loaded from cache)")
+
+            self.search.setEnabled(True)
+            self.chk_girl_looks_only.setEnabled(True)
+            self.chk_select_mode.setEnabled(True)
 
         self._start_change_check(cache_obj)
 
@@ -2093,12 +3006,11 @@ class MainWindow(QWidget):
             except Exception:
                 self.total_vars_count = 0
 
+            self._set_var_path_cache_from_cache(cache_obj)
+            self._set_var_deps_cache_from_cache(cache_obj)
             self._recompute_unused_count_from_scene_entries()
 
             self.status.setText(f"VaM Directory:\n{self.vam_dir}\n(Loaded from cache. Checking updates...)")
-            self.info_label.setText(
-                f"Total VARs: {self.total_vars_count} | Unused VARs: {self.unused_vars_count} | Scenes: {self.total_scene_files_found}"
-            )
 
             self.search.setEnabled(True)
             self.chk_girl_looks_only.setEnabled(True)
@@ -2117,7 +3029,7 @@ class MainWindow(QWidget):
     def _can_use_cache_for_current_folder(self, cache_obj: dict) -> bool:
         if not isinstance(cache_obj, dict):
             return False
-        if cache_obj.get("version") != 3:
+        if cache_obj.get("version") != 13:
             return False
         if not self.addon_dir:
             return False
@@ -2126,47 +3038,73 @@ class MainWindow(QWidget):
         vars_map = cache_obj.get("vars")
         if not isinstance(vars_map, dict):
             return False
+        if not isinstance(cache_obj.get("all_var_sigs"), dict):
+            return False
+        if not isinstance(cache_obj.get("var_paths"), dict):
+            return False
         return True
 
     def _scene_entries_from_cache(self, cache_obj: dict) -> list[dict]:
         out: list[dict] = []
+
+        if not isinstance(cache_obj, dict):
+            return out
+
         vars_map = cache_obj.get("vars", {})
         loose_map = cache_obj.get("loose", {})
 
+        # --- packaged scenes (from VAR cache) ---
         if isinstance(vars_map, dict):
             for var_name, vinfo in vars_map.items():
                 if not isinstance(vinfo, dict):
                     continue
+
                 scenes = vinfo.get("scenes", [])
                 if not isinstance(scenes, list):
                     continue
+
                 for s in scenes:
                     if not isinstance(s, dict):
                         continue
+
                     out.append({
                         "source": "var",
                         "scene_name": s.get("scene_name", ""),
                         "var_name": var_name,
                         "preview_relpath": s.get("preview_relpath", ""),
+                        "preview_inner": s.get("preview_inner", ""),  # <-- WAJIB
+                        "scene_path": s.get("scene_path", ""),  # for looks detection
                         "loose_relpath": "",
                         "is_girl_looks": None,
                     })
 
+
+        # --- loose scenes (Saves/scene on disk) ---
         if isinstance(loose_map, dict):
             for relp, linfo in loose_map.items():
                 if not isinstance(linfo, dict):
                     continue
-                scene_name = linfo.get("scene_name") or relp
+
+                scene_name = (linfo.get("scene_name") or relp) or ""
+
                 out.append({
                     "source": "loose",
                     "scene_name": scene_name,
                     "var_name": "(Saves/scene)",
                     "preview_relpath": "",
+                    "preview_inner": "",  # loose scenes don't have a var zip preview path
+                    "scene_path": "",
                     "loose_relpath": relp,
                     "is_girl_looks": None,
                 })
 
-        out.sort(key=lambda e: (str(e.get("source", "")), str(e.get("var_name", "")), str(e.get("scene_name", "")).lower()))
+        out.sort(
+            key=lambda e: (
+                str(e.get("source", "")),
+                str(e.get("var_name", "")),
+                str(e.get("scene_name", "")).lower()
+            )
+        )
         return out
 
     def _start_change_check(self, cache_obj: dict):
@@ -2198,17 +3136,34 @@ class MainWindow(QWidget):
         self.worker.start()
 
     def _recompute_unused_count_from_scene_entries(self):
+        self._unused_req_id += 1
         self.unused_vars_count = 0
+        self.info_label.setText(
+            f"Total VARs: {self.total_vars_count} | Unused VARs: - | Scenes: {self.total_scene_files_found}"
+        )
+
+    def _start_unused_count_worker(self):
         if not self.addon_dir:
             return
-        try:
-            all_vars = {p.name for p in self.addon_dir.glob("*.var")}
-            scene_vars = {e["var_name"] for e in self.scene_entries if e.get("source") == "var" and e.get("var_name")}
-            keep_all_scenes = self.compute_keep_set_for_scene_vars(scene_vars)
-            unused = all_vars - keep_all_scenes
-            self.unused_vars_count = len(unused)
-        except Exception:
-            self.unused_vars_count = 0
+        scene_vars = {e["var_name"] for e in self.scene_entries if e.get("source") == "var" and e.get("var_name")}
+        self._unused_req_id += 1
+        req_id = self._unused_req_id
+
+        self.info_label.setText(
+            f"Total VARs: {self.total_vars_count} | Unused VARs: calculating... | Scenes: {self.total_scene_files_found}"
+        )
+
+        self._unused_worker = UnusedCountWorker(self.addon_dir, scene_vars, self._var_deps_cache)
+        self._unused_worker.finished.connect(lambda count, rid=req_id: self._unused_count_done(count, rid))
+        self._unused_worker.start()
+
+    def _unused_count_done(self, count: int, req_id: int):
+        if req_id != self._unused_req_id:
+            return
+        self.unused_vars_count = max(0, int(count))
+        self.info_label.setText(
+            f"Total VARs: {self.total_vars_count} | Unused VARs: {self.unused_vars_count} | Scenes: {self.total_scene_files_found}"
+        )
 
     # ======================
     # Folder selection
@@ -2239,6 +3194,9 @@ class MainWindow(QWidget):
 
         self.scene_entries = []
         self.total_scene_files_found = 0
+        self._var_path_cache = {}
+        self._var_path_cache_ready = False
+        self._var_deps_cache = {}
 
         self.loading.start("Loading", "Scanning scenes...")
 
@@ -2273,18 +3231,18 @@ class MainWindow(QWidget):
 
         if isinstance(cache_obj, dict):
             cache_obj["looks"] = self.looks_map
-            self._save_scene_cache(cache_obj)
+            self._start_cache_save(cache_obj)
 
         self.scene_entries = scene_entries
         self.total_vars_count = total_var_count
         self.total_scene_files_found = len(self.scene_entries)
+        self._set_var_path_cache_from_cache(cache_obj)
+        self._set_var_deps_cache_from_cache(cache_obj)
+        self._update_scene_entries_looks()
 
         self._recompute_unused_count_from_scene_entries()
 
         self.status.setText(f"VaM Directory:\n{self.vam_dir}")
-        self.info_label.setText(
-            f"Total VARs: {self.total_vars_count} | Unused VARs: {self.unused_vars_count} | Scenes: {self.total_scene_files_found}"
-        )
 
         self.search.setEnabled(True)
         self.chk_girl_looks_only.setEnabled(True)
@@ -2297,6 +3255,9 @@ class MainWindow(QWidget):
         self.refresh_restore_button()
         self.refresh_apply_button()
 
+        if self._auto_preload_previews:
+            self._start_preload_all_previews()
+
         self._end_busy()
 
     # ======================
@@ -2304,152 +3265,478 @@ class MainWindow(QWidget):
     # ======================
 
     def _start_lazy_preview_loader(self):
-        if hasattr(self, "_preview_timer") and self._preview_timer.isActive():
-            self._preview_timer.stop()
+        self._preview_gen += 1
+        self._preview_pending.clear()
+        self._preview_cache_order.clear()
+        self._preview_cached_rows.clear()
+        self._visible_rows_cache.clear()
+        self._stop_preload_all_previews()
+        self._schedule_visible_previews()
 
-        self._preview_queue = [
-            c for c in self.cards
-            if getattr(c, "_preview_rel", "") and not getattr(c, "_preview_loaded", False)
-        ]
+    def _stop_all_preview_loaders(self):
+        if self._preload_timer.isActive():
+            self._preload_timer.stop()
+        if self._preview_schedule_timer.isActive():
+            self._preview_schedule_timer.stop()
+        for loader in self._preview_loaders:
+            try:
+                loader.stop()
+            except Exception:
+                pass
+        for loader in self._preview_loaders:
+            try:
+                loader.wait(2000)
+            except Exception:
+                pass
+        self._preview_loaders = []
+        self._preview_pending.clear()
+        self._preview_cache_order.clear()
+        self._preview_cached_rows.clear()
 
-        self._preview_timer = QTimer(self)
-        self._preview_timer.setInterval(1)  # cepat tapi non-blocking
-        self._preview_timer.timeout.connect(self._lazy_preview_tick)
-        self._preview_timer.start()
+    def _ensure_preview_loader(self):
+        if self._preview_loaders:
+            return
+        for _ in range(4):
+            loader = PreviewLoader(self)
+            loader.result.connect(self._on_preview_loaded)
+            loader.start()
+            self._preview_loaders.append(loader)
+        self._preview_loader_index = 0
 
+    def _schedule_visible_previews(self):
+        if self._preview_schedule_timer.isActive():
+            self._preview_schedule_timer.stop()
+        self._preview_schedule_timer.start()
 
-    def _lazy_preview_tick(self):
-        # load max 8 preview per tick (AMAN)
-        for _ in range(8):
-            if not self._preview_queue:
-                self._preview_timer.stop()
-                return
+    def _visible_proxy_range(self) -> tuple[int, int, int, int]:
+        total = self.scene_model.rowCount()
+        if total <= 0:
+            return 0, 0, -1, 1
 
-            c = self._preview_queue.pop(0)
-            rel = getattr(c, "_preview_rel", "")
-            if not rel:
+        grid = self.scene_view.gridSize()
+        spacing = self.scene_view.spacing()
+        cell_w = max(1, grid.width() + spacing)
+        cell_h = max(1, grid.height() + spacing)
+        cols = max(1, self.scene_view.viewport().width() // cell_w)
+
+        scroll_y = self.scene_view.verticalScrollBar().value()
+        first_row = max(0, int(scroll_y // cell_h))
+        visible_rows = int(self.scene_view.viewport().height() // cell_h) + 2
+
+        start = first_row * cols
+        end = min(total - 1, (first_row + visible_rows) * cols - 1)
+        return total, start, end, max(1, visible_rows * cols)
+
+    def _source_rows_from_proxy_range(self, start: int, end: int) -> list[int]:
+        if end < start:
+            return []
+        return list(range(start, end + 1))
+
+    def _visible_source_rows(self, extra_pages: int = 2) -> list[int]:
+        total, start, end, per_page = self._visible_proxy_range()
+        if total <= 0 or end < start:
+            return []
+        if extra_pages > 0:
+            end = min(total - 1, start + (per_page * (1 + extra_pages)) - 1)
+        return self._source_rows_from_proxy_range(start, end)
+
+    def _enqueue_visible_previews(self):
+        if not self.addon_dir:
+            return
+        if self.scene_model.rowCount() == 0:
+            return
+        self._ensure_preview_loader()
+
+        total, vis_start, vis_end, per_page = self._visible_proxy_range()
+        visible_now = set(self._source_rows_from_proxy_range(vis_start, vis_end))
+        self._visible_rows_cache = visible_now
+        if total <= 0 or vis_end < vis_start:
+            return
+        target_count = max(per_page * 2, 800)
+        prefetch_end = min(total - 1, vis_start + target_count - 1)
+
+        thumb_w = self._thumb_target.width()
+        thumb_h = self._thumb_target.height()
+        for row in self._source_rows_from_proxy_range(vis_start, prefetch_end):
+            if row in self._preview_pending:
+                continue
+            item = self.scene_model.get_item(row)
+            if not item:
+                continue
+            if item.get("preview_pixmap") is not None:
+                continue
+            if item.get("source") != "var":
                 continue
 
-            img = read_preview_bytes(rel)
-            if img:
-                try:
-                    c.set_preview_image_bytes(img)
-                except Exception:
-                    pass
+            var_name = item.get("var_name", "") or ""
+            scene_name = item.get("scene_name", "") or ""
+            if not var_name or not scene_name:
+                continue
 
-            c._preview_loaded = True
+            var_path = self.get_var_existing_path(var_name)
+            preview_rel = item.get("preview_relpath", "") or ""
+            if preview_rel and not self._preview_cache_exists(preview_rel):
+                preview_rel = ""
+                item["preview_relpath"] = ""
+            preview_inner = item.get("preview_inner", "") or ""
+            if not preview_rel and var_path is None:
+                continue
+
+            if not self._preview_loaders:
+                return
+            loader = self._preview_loaders[self._preview_loader_index % len(self._preview_loaders)]
+            self._preview_loader_index += 1
+            if loader.enqueue({
+                "row": row,
+                "gen": self._preview_gen,
+                "var_name": var_name,
+                "scene_name": scene_name,
+                "preview_rel": preview_rel,
+                "preview_inner": preview_inner,
+                "var_path": var_path,
+                "cache_only": False,
+                "cache_to_disk": True,
+                "thumb_w": thumb_w,
+                "thumb_h": thumb_h,
+            }, priority=0):
+                self._preview_pending.add(row)
+
+    def _on_preview_loaded(self, payload: dict):
+        try:
+            row = int(payload.get("row", -1))
+        except Exception:
+            row = -1
+
+        self._preview_pending.discard(row)
+
+        if payload.get("gen") != self._preview_gen:
+            return
+        if row < 0:
+            return
+
+        item = self.scene_model.get_item(row)
+        if not item:
+            return
+
+        if item.get("var_name") != payload.get("var_name") or item.get("scene_name") != payload.get("scene_name"):
+            return
+
+        rel = payload.get("preview_rel", "") or ""
+        inner = payload.get("preview_inner", "") or ""
+        if rel and item.get("preview_relpath") != rel:
+            item["preview_relpath"] = rel
+            try:
+                for e in self.scene_entries:
+                    if e.get("source") == "var" and e.get("var_name") == item.get("var_name") and e.get("scene_name") == item.get("scene_name"):
+                        e["preview_relpath"] = rel
+                        break
+            except Exception:
+                pass
+
+        if inner and item.get("preview_inner") != inner:
+            item["preview_inner"] = inner
+            try:
+                for e in self.scene_entries:
+                    if e.get("source") == "var" and e.get("var_name") == item.get("var_name") and e.get("scene_name") == item.get("scene_name"):
+                        e["preview_inner"] = inner
+                        break
+            except Exception:
+                pass
+
+        img_bytes = payload.get("bytes")
+        if img_bytes:
+            pix = self._scaled_pixmap_from_bytes(img_bytes)
+            if pix:
+                cache_only = bool(payload.get("cache_only", False))
+                if (not cache_only) or (row in self._visible_rows_cache):
+                    self.scene_model.set_preview_pixmap(row, pix)
+                    if row not in self._preview_cached_rows:
+                        self._preview_cached_rows.add(row)
+                        self._preview_cache_order.append(row)
+                    self._trim_preview_cache()
+
+    def _trim_preview_cache(self):
+        if len(self._preview_cache_order) <= self._preview_cache_limit:
+            return
+        visible = set(self._visible_source_rows(extra_pages=2))
+        attempts = 0
+        max_attempts = len(self._preview_cache_order)
+        while len(self._preview_cache_order) > self._preview_cache_limit and attempts < max_attempts:
+            row = self._preview_cache_order[0]
+            if row in visible:
+                self._preview_cache_order.rotate(-1)
+                attempts += 1
+                continue
+            self._preview_cache_order.popleft()
+            self._preview_cached_rows.discard(row)
+            self.scene_model.set_preview_pixmap(row, None)
+
+    def _on_preload_previews_clicked(self):
+        self._start_preload_all_previews()
+        self.update_selection_ui()
+
+    def _start_preload_all_previews(self):
+        if not self.addon_dir:
+            return
+        if self.scene_model.rowCount() == 0:
+            return
+        if self._preload_timer.isActive():
+            return
+        self._ensure_preview_loader()
+
+        total, vis_start, vis_end, _per_page = self._visible_proxy_range()
+        if total > 0 and vis_end >= vis_start:
+            self._visible_rows_cache = set(self._source_rows_from_proxy_range(vis_start, vis_end))
+
+        self._preload_full_cache_active = True
+        self._preview_cache_limit = max(self._preview_cache_limit, self.scene_model.rowCount())
+
+        self._preload_rows = []
+        for row in range(self.scene_model.rowCount()):
+            item = self.scene_model.get_item(row)
+            if not item:
+                continue
+            if item.get("source") != "var":
+                continue
+            preview_rel = item.get("preview_relpath", "") or ""
+            if preview_rel and self._preview_cache_exists(preview_rel):
+                continue
+            if preview_rel:
+                item["preview_relpath"] = ""
+            self._preload_rows.append(row)
+
+        self._preload_index = 0
+        if self._preload_rows:
+            self.btn_preload_previews.setText("Preloading...")
+            self.btn_preload_previews.setEnabled(False)
+            if not self._preload_status_base:
+                self._preload_status_base = self.status.text()
+            self.status.setText(f"{self._preload_status_base}\nPreloading previews...")
+            self._preload_timer.start()
+
+    def _stop_preload_all_previews(self):
+        if self._preload_timer.isActive():
+            self._preload_timer.stop()
+        self._preload_rows = []
+        self._preload_index = 0
+        self._preload_full_cache_active = False
+        if hasattr(self, "btn_preload_previews"):
+            self.btn_preload_previews.setText("Preload Previews")
+            self.update_selection_ui()
+        if self._preload_status_base:
+            self.status.setText(self._preload_status_base)
+            self._preload_status_base = ""
+        self._schedule_visible_previews()
+
+    def _preload_all_tick(self):
+        if not self._preload_rows:
+            self._preload_timer.stop()
+            self._stop_preload_all_previews()
+            return
+        if self._preload_index >= len(self._preload_rows):
+            self._preload_timer.stop()
+            self._stop_preload_all_previews()
+            return
+        if len(self._preview_pending) > 2500:
+            return
+        total, vis_start, vis_end, _per_page = self._visible_proxy_range()
+        if total > 0 and vis_end >= vis_start:
+            self._visible_rows_cache = set(self._source_rows_from_proxy_range(vis_start, vis_end))
+        thumb_w = self._thumb_target.width()
+        thumb_h = self._thumb_target.height()
+        batch = 150
+        end = min(len(self._preload_rows), self._preload_index + batch)
+        next_index = self._preload_index
+        for i in range(self._preload_index, end):
+            row = self._preload_rows[i]
+            if row in self._preview_pending:
+                next_index = i + 1
+                continue
+            item = self.scene_model.get_item(row)
+            if not item:
+                next_index = i + 1
+                continue
+            if item.get("preview_relpath"):
+                next_index = i + 1
+                continue
+            if item.get("source") != "var":
+                next_index = i + 1
+                continue
+
+            var_name = item.get("var_name", "") or ""
+            scene_name = item.get("scene_name", "") or ""
+            if not var_name or not scene_name:
+                next_index = i + 1
+                continue
+
+            var_path = self.get_var_existing_path(var_name)
+            preview_rel = item.get("preview_relpath", "") or ""
+            if preview_rel and not self._preview_cache_exists(preview_rel):
+                preview_rel = ""
+                item["preview_relpath"] = ""
+            preview_inner = item.get("preview_inner", "") or ""
+            if not preview_rel and var_path is None:
+                next_index = i + 1
+                continue
+
+            loader = self._preview_loaders[self._preview_loader_index % len(self._preview_loaders)]
+            self._preview_loader_index += 1
+            cache_only = False
+            if not loader.enqueue({
+                "row": row,
+                "gen": self._preview_gen,
+                "var_name": var_name,
+                "scene_name": scene_name,
+                "preview_rel": preview_rel,
+                "preview_inner": preview_inner,
+                "var_path": var_path,
+                "cache_only": cache_only,
+                "cache_to_disk": True,
+                "thumb_w": thumb_w,
+                "thumb_h": thumb_h,
+            }, priority=1):
+                break
+            self._preview_pending.add(row)
+            next_index = i + 1
+        if next_index > self._preload_index:
+            self._preload_index = next_index
+        if self._preload_rows and (self._preload_index % 600 == 0 or self._preload_index >= len(self._preload_rows)):
+            done = self._preload_index
+            total = len(self._preload_rows)
+            if self._preload_status_base:
+                self.status.setText(f"{self._preload_status_base}\nPreloading previews... {done}/{total}")
+
+    def _scaled_pixmap_from_bytes(self, image_bytes: bytes | None) -> QPixmap | None:
+        if not image_bytes:
+            return None
+        pix = QPixmap()
+        if not pix.loadFromData(image_bytes):
+            return None
+        try:
+            target = self.scene_delegate.image_size()
+            if target.width() > 0 and target.height() > 0:
+                if pix.width() > target.width() or pix.height() > target.height():
+                    return pix.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        except Exception:
+            pass
+        return pix
+
+    def _preview_cache_exists(self, rel_path: str) -> bool:
+        if not rel_path:
+            return False
+        try:
+            fp = app_data_dir() / rel_path
+            if not fp.exists():
+                return False
+            size = fp.stat().st_size
+            # treat large legacy previews as missing so we regenerate tiny thumbs
+            return 0 < size <= 300_000
+        except Exception:
+            return False
 
     
     def populate_scene_cards_from_entries(self):
-        self.cards = []
-        self.card_by_var = {}
-
-        entries_sorted = sorted(
+        self.scene_entries = sorted(
             self.scene_entries,
-            key=lambda e: (str(e.get("source", "")), str(e.get("var_name", "")), str(e.get("scene_name", "")).lower())
+            key=lambda e: (
+                str(e.get("source", "")),
+                str(e.get("var_name", "")),
+                str(e.get("scene_name", "")).lower()
+            )
         )
 
-        for e in entries_sorted:
-            source = e.get("source", "var")
-            scene_name = e.get("scene_name", "")
-            var_name = e.get("var_name", "")
-            rel = e.get("preview_relpath", "") or ""
-
-            card = SceneCard(scene_name=scene_name, var_name=var_name, image_bytes=None)
-
-            # simpan rel path untuk lazy load
-            card._preview_rel = rel
-            card._preview_loaded = False
-
-            card.clicked.connect(self.on_card_clicked)
-
-            selectable = (source == "var")
-            card.set_selection_mode(self.is_selection_mode() and selectable)
-
-            if selectable:
-                card.set_checked(card.var_name in self.selected_scene_vars)
-                self.card_by_var.setdefault(card.var_name, []).append(card)
-            else:
-                card.set_checked(False)
-
-            k = f"{var_name}::{scene_name}"
-            looks_val = self.looks_map.get(k, None)
-            card.is_girl_looks = looks_val  # type: ignore[attr-defined]
-
-            card.source = source  # type: ignore[attr-defined]
-            card.loose_relpath = e.get("loose_relpath", "")  # type: ignore[attr-defined]
-
-            self.cards.append(card)
-
-        self.rebuild_grid(self.cards)
-        self._start_lazy_preview_loader()
-
-
-    def rebuild_grid(self, cards_to_show: list[SceneCard]):
-        while self.scene_grid.count():
-            item = self.scene_grid.takeAt(0)
-            w = item.widget()
-            if w:
-                w.setParent(self.grid_holder)
-
-        col = 0
-        row = 0
-        max_cols = self._calc_max_cols()
-
-        for card in cards_to_show:
-            self.scene_grid.addWidget(card, row, col)
-            col += 1
-            if col >= max_cols:
-                col = 0
-                row += 1
-
     def clear_scene_cards(self):
-        self.cards = []
-        self.card_by_var = {}
-        while self.scene_grid.count():
-            item = self.scene_grid.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
+        self.scene_model.set_entries([])
+        self._preview_gen += 1
+        self._preview_pending.clear()
+        self._preview_cache_order.clear()
+        self._preview_cached_rows.clear()
+        self._visible_rows_cache.clear()
+        self._stop_preload_all_previews()
 
     def apply_filter(self, text: str):
+        self.page_index = 0
+        self._apply_filter_and_pagination(text)
+        self._schedule_visible_previews()
+
+    def _apply_filter_and_pagination(self, text: str):
         q = (text or "").strip().lower()
         looks_only = self.chk_girl_looks_only.isChecked()
 
-        selected_matches: list[SceneCard] = []
-        other_matches: list[SceneCard] = []
+        self._stop_preload_all_previews()
 
-        for card in self.cards:
-            scene_name = card.scene_name
-            var_name = card.var_name
-
-            is_match = (not q) or (q in scene_name.lower()) or (q in var_name.lower())
-            if not is_match:
-                card.setVisible(False)
-                continue
-
+        filtered: list[dict] = []
+        for e in self.scene_entries:
+            scene_name = str(e.get("scene_name", ""))
+            var_name = str(e.get("var_name", ""))
+            if q:
+                if q not in scene_name.lower() and q not in var_name.lower():
+                    continue
             if looks_only:
-                src = getattr(card, "source", "var")
-                if src != "var":
-                    card.setVisible(False)
+                if e.get("source", "var") != "var":
                     continue
-
-                v = getattr(card, "is_girl_looks", None)
-                if v is None:
-                    card.setVisible(False)
+                looks_val = e.get("is_girl_looks")
+                if looks_val is None or not bool(looks_val):
                     continue
-                if not bool(v):
-                    card.setVisible(False)
-                    continue
+            filtered.append(e)
 
-            card.setVisible(True)
+        self._filtered_entries = filtered
+        total = len(filtered)
+        if self.use_pagination:
+            self._total_pages = max(1, (total + self.page_size - 1) // self.page_size)
+            if self.page_index >= self._total_pages:
+                self.page_index = self._total_pages - 1
+            if self.page_index < 0:
+                self.page_index = 0
 
-            if var_name in self.selected_scene_vars:
-                selected_matches.append(card)
-            else:
-                other_matches.append(card)
+            start = self.page_index * self.page_size
+            end = min(total, start + self.page_size)
+            page_entries = filtered[start:end]
+        else:
+            self.page_index = 0
+            self._total_pages = 1
+            page_entries = filtered
 
-        self.rebuild_grid(selected_matches + other_matches)
+        self.scene_model.set_entries(page_entries)
+        self.scene_model.set_selection_mode(self.is_selection_mode())
+        self.scene_model.set_looks_map(self.looks_map)
+        for var_name in self.selected_scene_vars:
+            self.scene_model.set_selected_for_var(var_name, True)
+
+        self._start_lazy_preview_loader()
+        if self._auto_preload_previews:
+            self._start_preload_all_previews()
+
+        self._update_page_controls()
+        self.update_selection_ui()
+
+    def _update_scene_entries_looks(self):
+        if not self.looks_map:
+            return
+        for e in self.scene_entries:
+            if e.get("source", "var") != "var":
+                continue
+            k = f"{e.get('var_name', '')}::{e.get('scene_name', '')}"
+            if k in self.looks_map:
+                e["is_girl_looks"] = bool(self.looks_map.get(k, False))
+
+    def _update_page_controls(self):
+        if not self.use_pagination:
+            if hasattr(self, "page_controls"):
+                self.page_controls.setVisible(False)
+            return
+        total = self._total_pages
+        current = self.page_index + 1
+        self.page_label.setText(f"Page {current}/{total}")
+        has_scenes = (self.addon_dir is not None) and (self.scene_entries is not None) and (len(self.scene_entries) > 0)
+        self.btn_page_prev.setEnabled(has_scenes and self.page_index > 0)
+        self.btn_page_next.setEnabled(has_scenes and self.page_index < (total - 1))
+
+    def _change_page(self, delta: int):
+        if not self.use_pagination or self._total_pages <= 1:
+            return
+        self.page_index = max(0, min(self.page_index + delta, self._total_pages - 1))
+        self._apply_filter_and_pagination(self.search.text())
 
     # ======================
     # Looks-only
@@ -2462,20 +3749,21 @@ class MainWindow(QWidget):
         if not self.addon_dir:
             return
 
-        pairs: list[tuple[str, str]] = []
-        for c in self.cards:
-            if getattr(c, "source", "var") != "var":
+        pairs: list[tuple[str, str, str]] = []
+        for row in range(self.scene_model.rowCount()):
+            item = self.scene_model.get_item(row)
+            if item.get("source", "var") != "var":
                 continue
-            k = f"{c.var_name}::{c.scene_name}"
+            k = f"{item.get('var_name', '')}::{item.get('scene_name', '')}"
             if k not in self.looks_map:
-                pairs.append((c.var_name, c.scene_name))
+                pairs.append((
+                    item.get("var_name", ""),
+                    item.get("scene_name", ""),
+                    item.get("scene_path", "") or "",
+                ))
 
         if not pairs:
-            for c in self.cards:
-                if getattr(c, "source", "var") != "var":
-                    continue
-                k = f"{c.var_name}::{c.scene_name}"
-                c.is_girl_looks = self.looks_map.get(k, False)  # type: ignore[attr-defined]
+            self.scene_model.set_looks_map(self.looks_map)
             self.apply_filter(self.search.text())
             return
 
@@ -2496,11 +3784,8 @@ class MainWindow(QWidget):
         if isinstance(looks_map, dict):
             self.looks_map = looks_map
 
-            for c in self.cards:
-                if getattr(c, "source", "var") != "var":
-                    continue
-                k = f"{c.var_name}::{c.scene_name}"
-                c.is_girl_looks = self.looks_map.get(k, False)  # type: ignore[attr-defined]
+            self.scene_model.set_looks_map(self.looks_map)
+            self._update_scene_entries_looks()
 
             old = self._load_scene_cache()
             if isinstance(old, dict):
@@ -2515,21 +3800,10 @@ class MainWindow(QWidget):
     # ======================
     def on_toggle_selection_mode(self, _state: int):
         enabled = self.is_selection_mode()
+        self.scene_model.set_selection_mode(enabled)
+        if not enabled:
+            self.scene_model.set_active_row(-1)
 
-        self.scene_container.setUpdatesEnabled(False)
-        try:
-            for card in self.cards:
-                src = getattr(card, "source", "var")
-                selectable = (src == "var")
-                card.set_selection_mode(enabled and selectable)
-                if selectable:
-                    card.set_checked(card.var_name in self.selected_scene_vars)
-                else:
-                    card.set_checked(False)
-        finally:
-            self.scene_container.setUpdatesEnabled(True)
-
-        self.apply_filter(self.search.text())
         self.update_selection_ui()
 
 
@@ -2564,9 +3838,7 @@ class MainWindow(QWidget):
             else:
                 self.selected_scene_vars.discard(var_name)
 
-            # update card checkmarks (cheap)
-            for c in self.card_by_var.get(var_name, []):
-                c.set_checked(selected)
+            self.scene_model.set_selected_for_var(var_name, selected)
         finally:
             self._syncing_selection_ui = False
 
@@ -2574,7 +3846,6 @@ class MainWindow(QWidget):
         if self._batch_selection:
             return
 
-        self.apply_filter(self.search.text())
         self.update_selection_ui()
         self._schedule_check_selection_dirty()
 
@@ -2585,23 +3856,32 @@ class MainWindow(QWidget):
             f"Total Scene: {self.total_scene_files_found} scenes | Selected Scene: {len(self.selected_scene_vars)} scenes"
         )
 
-        enabled_card_tools = self.is_selection_mode() and (self.addon_dir is not None) and (len(self.cards) > 0)
+        has_scenes = (self.addon_dir is not None) and (self.scene_model.rowCount() > 0)
+        enabled_card_tools = self.is_selection_mode() and has_scenes
         self.btn_select_all.setEnabled(enabled_card_tools)
         self.btn_clear_sel.setEnabled(enabled_card_tools)
 
         self.btn_save_preset.setEnabled(enabled_card_tools)
         self.btn_load_preset.setEnabled(enabled_card_tools)
         self.preset_combo.setEnabled(enabled_card_tools)
+        self.btn_preload_previews.setEnabled(has_scenes and not self._preload_timer.isActive())
 
     def select_all_visible(self):
-        if not self.cards:
+        if self.scene_model.rowCount() == 0:
             return
 
         self._begin_batch_selection()
         try:
-            for var_name, cards in self.card_by_var.items():
-                if any(c.isVisible() for c in cards):
-                    self._set_var_selected(var_name, True)
+            visible_vars: set[str] = set()
+            for row in range(self.scene_model.rowCount()):
+                item = self.scene_model.get_item(row)
+                if item.get("source") != "var":
+                    continue
+                vname = item.get("var_name") or ""
+                if vname:
+                    visible_vars.add(vname)
+            for var_name in visible_vars:
+                self._set_var_selected(var_name, True)
         finally:
             self._end_batch_selection()
 
@@ -2614,31 +3894,34 @@ class MainWindow(QWidget):
         try:
             for var_name in list(self.selected_scene_vars):
                 self._set_var_selected(var_name, False)
-            self.selected_scene_vars.clear()
         finally:
             self._end_batch_selection()
 
 
-    def on_card_clicked(self, scene_name: str, var_name: str):
-        clicked_card = None
-        for c in self.cards:
-            if c.scene_name == scene_name and c.var_name == var_name:
-                clicked_card = c
-                break
-        if clicked_card is None:
+    def on_scene_clicked(self, proxy_index: QModelIndex):
+        if not proxy_index.isValid():
+            return
+        row = proxy_index.row()
+        item = self.scene_model.get_item(row)
+        if not item:
             return
 
-        src = getattr(clicked_card, "source", "var")
+        scene_name = item.get("scene_name", "")
+        var_name = item.get("var_name", "")
+        src = item.get("source", "var")
 
         if src == "var":
             if not self.addon_dir:
                 return
             if self.is_selection_mode():
                 self._set_var_selected(var_name, not (var_name in self.selected_scene_vars))
+            else:
+                self.scene_model.set_active_row(row)
             self.show_dependencies(scene_name, var_name)
             return
 
-        self.show_loose_scene_info(clicked_card)
+        self.scene_model.set_active_row(row)
+        self.show_loose_scene_info(item)
 
     # ======================
     # Dependencies panel
@@ -2652,8 +3935,8 @@ class MainWindow(QWidget):
             if w:
                 w.deleteLater()
 
-    def show_loose_scene_info(self, card: SceneCard):
-        relp = getattr(card, "loose_relpath", "")
+    def show_loose_scene_info(self, item: dict):
+        relp = item.get("loose_relpath", "")
         self.dep_selected.setText(f"Selected (Saves/scene):\n{relp}")
         self.dep_summary.setText("Loose scene: dependency graph not available in this app.")
         while self.dep_list_layout.count():
@@ -2683,9 +3966,9 @@ class MainWindow(QWidget):
             self.dep_list_layout.addStretch(1)
             return
 
-        info = scan_var(var_path)
-
+        info = scan_var_meta_only(var_path)
         deps = sorted(info.get("dependencies", []))
+
 
         # IMPORTANT: all vars should include disabled too
         all_vars = set(self.list_var_state_map().keys())
@@ -2796,13 +4079,14 @@ class MainWindow(QWidget):
             for item in renamed:
                 if not isinstance(item, dict):
                     continue
-                src_name = item.get("to")
-                dst_name = item.get("from")
+                src_name = item.get("to_rel") or item.get("to")
+                dst_name = item.get("from_rel") or item.get("from")
                 if not src_name or not dst_name:
                     continue
 
-                src = addon_dir / src_name
-                dst = addon_dir / dst_name
+                src = addon_dir / str(src_name)
+                dst = addon_dir / str(dst_name)
+                dst.parent.mkdir(parents=True, exist_ok=True)
 
                 if src.exists() and not dst.exists():
                     try:
@@ -2831,7 +4115,7 @@ class MainWindow(QWidget):
     def _scene_vars_for_launch(self) -> set[str]:
         if self.selected_scene_vars:
             return set(self.selected_scene_vars)
-        return set(self.card_by_var.keys())
+        return self.all_var_names_catalog()
 
     def compute_keep_set_for_scene_vars(self, scene_vars: set[str]) -> set[str]:
         assert self.addon_dir is not None
@@ -2850,10 +4134,8 @@ class MainWindow(QWidget):
         for scene_var in scene_vars:
             if scene_var in all_vars:
                 keep.add(scene_var)
-                p = self.get_var_existing_path(scene_var)
-                if p:
-                    info = scan_var(p)
-                    queue.extend(list(info.get("dependencies", [])))
+                queue.extend(self._deps_for_var_name(scene_var))
+
 
         # Resolve dependencies recursively
         while queue:
@@ -2861,10 +4143,8 @@ class MainWindow(QWidget):
             for matched_var in resolve_dependency(dep, all_vars):
                 if matched_var not in keep:
                     keep.add(matched_var)
-                    p = self.get_var_existing_path(matched_var)
-                    if p:
-                        info = scan_var(p)
-                        queue.extend(list(info.get("dependencies", [])))
+                    queue.extend(self._deps_for_var_name(matched_var))
+
 
         return keep
 
@@ -2881,31 +4161,29 @@ class MainWindow(QWidget):
         mp = manifest_path_for(self.vam_dir)
 
         renamed: list[dict] = []
+        failed: list[str] = []
 
-        # Use state map so we don't miss vars that exist but currently disabled
-        state_map = self.list_var_state_map()
-
-        for orig_name, state in state_map.items():
+        for orig_name, actual_path in fast_list_vars_all_states(addon_dir):
+            if not actual_path.name.lower().endswith(".var"):
+                continue
+            src = actual_path
             if orig_name in keep_set:
                 continue
-
-            # Only disable if currently enabled
-            if state != "enabled":
-                continue
-
-            src = addon_dir / orig_name
-            dst = addon_dir / (orig_name + DISABLED_SUFFIX)
-
-            if not src.exists():
-                continue
+            dst = src.with_name(orig_name + DISABLED_SUFFIX)
             if dst.exists():
                 continue
-
             try:
+                rel_from = src.relative_to(addon_dir)
+                rel_to = dst.relative_to(addon_dir)
                 src.rename(dst)
-                renamed.append({"from": orig_name, "to": dst.name})
+                renamed.append({
+                    "from": orig_name,
+                    "to": dst.name,
+                    "from_rel": str(rel_from).replace("\\", "/"),
+                    "to_rel": str(rel_to).replace("\\", "/"),
+                })
             except Exception:
-                continue
+                failed.append(orig_name)
 
         manifest = {
             "addon_dir": str(addon_dir),
@@ -2916,6 +4194,19 @@ class MainWindow(QWidget):
         }
 
         mp.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+        if failed:
+            try:
+                log_path = app_data_dir() / "disable_failures.txt"
+                log_path.write_text("\n".join(failed), encoding="utf-8")
+                QMessageBox.warning(
+                    self,
+                    "Some VARs could not be disabled",
+                    f"{len(failed)} VAR files could not be renamed.\n\n"
+                    f"See: {log_path}"
+                )
+            except Exception:
+                pass
         return manifest
 
 
@@ -2935,87 +4226,99 @@ class MainWindow(QWidget):
         if not isinstance(renamed_list, list):
             renamed_list = []
 
-        # tool_map: orig -> disabled_filename (only what tool is responsible for)
-        tool_map: dict[str, str] = {}
+        tool_items: list[dict] = []
         for item in renamed_list:
             if not isinstance(item, dict):
                 continue
-            o = item.get("from")
-            d = item.get("to")
-            if isinstance(o, str) and isinstance(d, str) and o and d:
-                tool_map[o] = d
+            src_rel = item.get("to_rel") or item.get("to")
+            dst_rel = item.get("from_rel") or item.get("from")
+            if not isinstance(src_rel, str) or not isinstance(dst_rel, str):
+                continue
+            if not src_rel or not dst_rel:
+                continue
+            tool_items.append({
+                "from": Path(dst_rel).name,
+                "from_rel": dst_rel,
+                "to_rel": src_rel,
+            })
 
         disabled_count = 0
         restored_count = 0
-
-        state_map = self.list_var_state_map()
+        failed: list[str] = []
 
         # 1) Restore tool-disabled vars that are now in keep_set
-        for orig, dis_name in list(tool_map.items()):
+        remaining: list[dict] = []
+        for item in tool_items:
+            orig = item.get("from", "")
             if orig not in keep_set:
+                remaining.append(item)
                 continue
-
-            src = addon_dir / dis_name
-            dst = addon_dir / orig
-
+            src = addon_dir / item.get("to_rel", "")
+            dst = addon_dir / item.get("from_rel", "")
             if src.exists() and not dst.exists():
                 try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
                     src.rename(dst)
                     restored_count += 1
-                    # remove from tool_map because it's no longer disabled by tool
-                    tool_map.pop(orig, None)
                 except Exception:
-                    pass
-
-        # Refresh state after restores
-        state_map = self.list_var_state_map()
+                    remaining.append(item)
+            else:
+                remaining.append(item)
 
         # 2) Disable vars NOT in keep_set (only if currently enabled)
-        # IMPORTANT: Use catalog so it still works when most are disabled
-        catalog = self.all_var_names_catalog()
-        if not catalog:
-            catalog = set(state_map.keys())
-
-        for orig in catalog:
+        disabled_by_tool = {item.get("from") for item in remaining if item.get("from")}
+        for orig, actual_path in fast_list_vars_all_states(addon_dir):
+            if not actual_path.name.lower().endswith(".var"):
+                continue
+            src = actual_path
             if orig in keep_set:
                 continue
-
-            # Already disabled by our tool?
-            if orig in tool_map:
+            if orig in disabled_by_tool:
                 continue
-
-            # Only disable if currently enabled on disk
-            if state_map.get(orig) != "enabled":
-                continue
-
-            src = addon_dir / orig
-            dst = addon_dir / (orig + DISABLED_SUFFIX)
-
-            if not src.exists():
-                continue
+            dst = src.with_name(orig + DISABLED_SUFFIX)
             if dst.exists():
-                # don't overwrite; safest do nothing
                 continue
-
             try:
+                rel_from = src.relative_to(addon_dir)
+                rel_to = dst.relative_to(addon_dir)
                 src.rename(dst)
-                tool_map[orig] = dst.name
+                remaining.append({
+                    "from": orig,
+                    "from_rel": str(rel_from).replace("\\", "/"),
+                    "to_rel": str(rel_to).replace("\\", "/"),
+                })
                 disabled_count += 1
             except Exception:
-                pass
+                failed.append(orig)
 
         # 3) Write updated manifest from tool_map (only what tool currently disables)
         new_manifest = {
             "addon_dir": str(addon_dir),
             "method": "rename_disabled",
             "disabled_suffix": DISABLED_SUFFIX,
-            "renamed": [{"from": o, "to": d} for o, d in sorted(tool_map.items())],
+            "renamed": [
+                {"from": i.get("from"), "to": Path(i.get("to_rel", "")).name, "from_rel": i.get("from_rel"), "to_rel": i.get("to_rel")}
+                for i in remaining
+            ],
             "saved_at": time.time(),
         }
         try:
             mp.write_text(json.dumps(new_manifest, indent=2), encoding="utf-8")
         except Exception:
             pass
+
+        if failed:
+            try:
+                log_path = app_data_dir() / "disable_failures.txt"
+                log_path.write_text("\n".join(failed), encoding="utf-8")
+                QMessageBox.warning(
+                    self,
+                    "Some VARs could not be disabled",
+                    f"{len(failed)} VAR files could not be renamed.\n\n"
+                    f"See: {log_path}"
+                )
+            except Exception:
+                pass
 
         return disabled_count, restored_count
 
@@ -3071,8 +4374,10 @@ class MainWindow(QWidget):
 
             # If no manifest exists yet, do initial disable to create manifest
             if not mp_exists:
+                self._stop_all_preview_loaders()
                 self.disable_unrelated_vars_by_rename(keep_set)
 
+            self._stop_all_preview_loaders()
             disabled_n, restored_n = self._apply_keep_set_live(keep_set)
 
             # update baseline after successful apply
@@ -3089,6 +4394,7 @@ class MainWindow(QWidget):
             self.progress.setVisible(False)
             self.status.setText(f"VaM Directory:\n{self.vam_dir}")
 
+            self._start_lazy_preview_loader()
             QMessageBox.information(
                 self,
                 "Applied",
@@ -3143,6 +4449,7 @@ class MainWindow(QWidget):
 
         try:
             keep_set = self.compute_keep_set_for_scene_vars(scene_vars)
+            self._stop_all_preview_loaders()
             self.disable_unrelated_vars_by_rename(keep_set)
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to disable vars:\n{e}")

@@ -20,6 +20,12 @@ def resolve_dependency(dep_name: str, all_vars: set[str]) -> list[str]:
     """
     matches = []
 
+    if dep_name.endswith(".var"):
+        exact = dep_name
+        if exact in all_vars:
+            return [exact]
+        return []
+
     if dep_name.endswith(".latest"):
         base = dep_name[:-len(".latest")]
         matches = [
