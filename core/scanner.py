@@ -179,6 +179,8 @@ def _scene_json_path_for_scene(content_list: list[str], scene_name: str) -> str:
     return ""
 
 
+
+
 def scan_var_meta_only(var_path: Path, include_hidden: bool = True) -> dict[str, Any]:
     """
     FAST: reads meta.json and zip namelist (no scene json read).
@@ -250,6 +252,8 @@ def scan_var_meta_only(var_path: Path, include_hidden: bool = True) -> dict[str,
         pass
 
     return out
+
+
 
 
 def scan_var_meta_with_previews(var_path: Path, include_hidden: bool = True) -> dict[str, Any]:

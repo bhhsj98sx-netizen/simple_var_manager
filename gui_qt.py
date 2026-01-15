@@ -1114,6 +1114,7 @@ class AnalyzeWorker(QThread):
                         "preview_relpath": "",
                         "preview_inner": preview_inner, # IMPORTANT
                         "scene_path": scene_inner,  # for looks detection
+                        "is_girl_looks": None,
                     })
 
                 deps = info.get("dependencies", [])
@@ -2948,6 +2949,7 @@ class MainWindow(QWidget):
             if self.scene_model.rowCount() == 0:
                 self.looks_map = cache_obj.get("looks", {}) if isinstance(cache_obj.get("looks"), dict) else {}
                 self.scene_entries = self._scene_entries_from_cache(cache_obj)
+                self._update_scene_entries_looks()
                 self.total_scene_files_found = len(self.scene_entries)
                 try:
                     self.total_vars_count = len(list(self.addon_dir.glob("*.var"))) if self.addon_dir else 0
@@ -2999,6 +3001,7 @@ class MainWindow(QWidget):
             self.looks_map = cache_obj.get("looks", {}) if isinstance(cache_obj.get("looks"), dict) else {}
 
             self.scene_entries = self._scene_entries_from_cache(cache_obj)
+            self._update_scene_entries_looks()
             self.total_scene_files_found = len(self.scene_entries)
 
             try:
@@ -3075,7 +3078,7 @@ class MainWindow(QWidget):
                         "preview_inner": s.get("preview_inner", ""),  # <-- WAJIB
                         "scene_path": s.get("scene_path", ""),  # for looks detection
                         "loose_relpath": "",
-                        "is_girl_looks": None,
+                        "is_girl_looks": s.get("is_girl_looks", None),
                     })
 
 
@@ -3230,6 +3233,8 @@ class MainWindow(QWidget):
         self.progress.setVisible(False)
 
         if isinstance(cache_obj, dict):
+            if isinstance(cache_obj.get("looks"), dict):
+                self.looks_map = cache_obj.get("looks", {})
             cache_obj["looks"] = self.looks_map
             self._start_cache_save(cache_obj)
 
