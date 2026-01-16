@@ -1,4 +1,5 @@
 import sys
+from datetime import datetime
 import os
 import sys
 import json
@@ -80,7 +81,7 @@ They are temporarily renamed from:<br>
 </p>
 
 <p>
-When you close <b>VaM.exe</b>, all renamed files will automatically restore back to normal.
+When you close <b>VaM.exe</b>, all renamed files will automatically restore back to normal. If anything happen or you close the tool, you can restore manually through "Restore Disabled VARs" button
 </p>
 
 <hr>
@@ -102,11 +103,11 @@ When you close <b>VaM.exe</b>, all renamed files will automatically restore back
     <ul>
       <li>
         <b>Choose which scenes you want to play</b><br>
-        All unrelated .var files to those scenes will be temporarily disabled.
+        All unrelated .var files to those scenes will be temporarily disabled. So VaM wont read them
       </li>
       <li>
         <b>Select nothing</b><br>
-        The app will disable only .var files that are <b>not used by any scene at all</b>.
+        All scene will be present in your game, The app will disable only .var files that are <b>not used by any scene at all (unreferenced anywhere)</b>.
       </li>
     </ul>
   </li>
@@ -117,7 +118,7 @@ When you close <b>VaM.exe</b>, all renamed files will automatically restore back
   </li>
 
   <li>
-    <b>Live mode (NEW)</b><br>
+    <b>Live mode</b><br>
     While VaM is running, you can change selection and click <b>Update Scene Selection</b>.<br>
     Then in VaM, use its refresh / rescan packages button to update the package list.
   </li>
@@ -146,7 +147,6 @@ When you close <b>VaM.exe</b>, all renamed files will automatically restore back
     <ul>
       <li>VaM crashed</li>
       <li>You closed the app unexpectedly</li>
-      <li>You want to cancel a lean session manually</li>
     </ul>
   </li>
 
@@ -238,6 +238,7 @@ def _normalize_supporters_payload(obj: dict) -> dict:
 
 def load_supporters_cached(max_age_hours: float = 2.0) -> dict:
     cache = supporters_cache_path()
+    fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     if cache.exists():
         try:
@@ -256,6 +257,7 @@ def load_supporters_cached(max_age_hours: float = 2.0) -> dict:
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = resp.read().decode("utf-8", errors="ignore")
         obj = json.loads(data)
+        obj["updated"] = fetched_at
 
         cache.write_text(json.dumps(obj, indent=2), encoding="utf-8")
         return _normalize_supporters_payload(obj)
@@ -263,6 +265,8 @@ def load_supporters_cached(max_age_hours: float = 2.0) -> dict:
         if cache.exists():
             try:
                 obj = json.loads(cache.read_text(encoding="utf-8"))
+                obj["updated"] = fetched_at
+                cache.write_text(json.dumps(obj, indent=2), encoding="utf-8")
                 return _normalize_supporters_payload(obj)
             except Exception:
                 return {"updated": "unknown", "supporters": []}
@@ -591,17 +595,17 @@ class SceneDelegate(QStyledItemDelegate):
         rect = option.rect.adjusted(4, 4, -4, -4)
         selection_mode = bool(index.data(ROLE_SELECTION_MODE))
         selected = bool(index.data(ROLE_SELECTED)) and selection_mode
-        active = bool(index.data(ROLE_ACTIVE))
+        active = bool(index.data(ROLE_ACTIVE)) and not selection_mode
         hovered = bool(option.state & QStyle.State_MouseOver)
 
         bg_color = QColor(255, 255, 255, 6)
         border_color = QColor(0, 0, 0, 0)
         if selected:
-            border_color = QColor(61, 174, 233)
-            bg_color = QColor(61, 174, 233, 30)
+            border_color = QColor(39, 174, 96)
+            bg_color = QColor(39, 174, 96, 50)
         elif active:
-            border_color = QColor(241, 196, 15)
-            bg_color = QColor(241, 196, 15, 24)
+            border_color = QColor(61, 174, 233)
+            bg_color = QColor(61, 174, 233, 24)
         elif hovered:
             border_color = QColor(100, 100, 100)
             bg_color = QColor(255, 255, 255, 10)
@@ -856,12 +860,12 @@ class LoadingPopup(QDialog):
         lay.setSpacing(10)
 
         self.label = QLabel("Loading...")
-        self.label.setStyleSheet("color: #eee; font-size: 13px; font-weight: 600;")
+        self.label.setStyleSheet("color: #eee; font-size: 10pt; font-weight: 600;")
         self.label.setAlignment(Qt.AlignCenter)
         lay.addWidget(self.label)
 
         self.sub = QLabel("Please wait")
-        self.sub.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.sub.setStyleSheet("color: #aaa; font-size: 9pt;")
         self.sub.setAlignment(Qt.AlignCenter)
         lay.addWidget(self.sub)
 
@@ -948,13 +952,11 @@ class DonationDialog(QDialog):
         layout = QVBoxLayout(self)
 
         title = QLabel("Thanks to my supporters")
-        title.setStyleSheet("font-weight: bold; font-size: 16px;")
+        title.setStyleSheet("font-weight: bold; font-size: 12pt;")
         layout.addWidget(title)
 
         data = load_supporters_cached(max_age_hours=2.0)
         supporters = data.get("supporters", [])
-        updated = data.get("updated", "unknown")
-
         if supporters:
             lines = []
             for s in supporters:
@@ -970,6 +972,7 @@ class DonationDialog(QDialog):
 
         self.text = QTextEdit()
         self.text.setReadOnly(True)
+        updated = data.get("updated", "unknown")
         self.text.setPlainText(text + f"\n\nLast updated: {updated}")
         layout.addWidget(self.text, 1)
 
@@ -1661,11 +1664,11 @@ class LooksWorker(QThread):
 # Dependency row widget
 # ======================
 class DependencyRow(QWidget):
-    def __init__(self, text: str, present: bool):
+    def __init__(self, text: str, present: bool, dark: bool = True):
         super().__init__()
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(10)
 
         strip = QFrame()
         strip.setFixedWidth(10)
@@ -1679,10 +1682,24 @@ class DependencyRow(QWidget):
         label = QLabel(text)
         label.setWordWrap(True)
         label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        label.setStyleSheet("color: #9be28c;" if present else "color: #ff8b8b;")
         layout.addWidget(label, 1)
 
+        self._strip = strip
+        self._label = label
+        self._present = present
+        self._apply_style(dark)
         self.setLayout(layout)
+
+    def _apply_style(self, dark: bool):
+        if dark:
+            self.setStyleSheet("border-radius: 6px;")
+            self._label.setStyleSheet("color: #9be28c;" if self._present else "color: #ff8b8b;")
+        else:
+            self.setStyleSheet("background-color: #f0e8db; border: 1px solid #e0d7c8; border-radius: 6px;")
+            self._label.setStyleSheet("color: #2d2d2d;" if self._present else "color: #7a1e12;")
+    
+    def set_theme(self, dark: bool):
+        self._apply_style(dark)
 
 
 # ======================
@@ -1703,7 +1720,7 @@ def build_btn_css(dark: bool) -> str:
         QPushButton, QComboBox {
             min-height: 26px;
             padding: 6px 14px;
-            font-size: 12px;
+            font-size: 9pt;
         }
 
         QPushButton:disabled, QComboBox:disabled {
@@ -1718,7 +1735,7 @@ def build_btn_css(dark: bool) -> str:
         QPushButton, QComboBox {
             min-height: 26px;
             padding: 6px 14px;
-            font-size: 12px;
+            font-size: 9pt;
 
             background-color: rgba(255,255,255,0.08);
             border: 1px solid rgba(255,255,255,0.18);
@@ -1801,6 +1818,131 @@ class MainWindow(QWidget):
     def _set_dim_label(self, label: QLabel, dark_hex: str):
         if self._dark:
             label.setStyleSheet(f"color: {dark_hex};")
+        else:
+            label.setStyleSheet("")
+
+    def _card_header_css(self, dark: bool) -> str:
+        if dark:
+            return """
+            QWidget {
+                background: rgba(255,255,255,0.03);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 8px;
+            }
+            """
+        return """
+        QWidget {
+            background: rgba(0,0,0,0.03);
+            border: 1px solid rgba(0,0,0,0.08);
+            border-radius: 8px;
+        }
+        """
+
+    def _progress_css(self, dark: bool) -> str:
+        if dark:
+            return """
+            QProgressBar {
+                border: 1px solid rgba(255,255,255,0.25);
+                border-radius: 6px;
+                background-color: rgba(255,255,255,0.08);
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #3daee9;
+                border-radius: 6px;
+            }
+            """
+        return """
+        QProgressBar {
+            border: 1px solid rgba(0,0,0,0.2);
+            border-radius: 6px;
+            background-color: rgba(0,0,0,0.05);
+            text-align: center;
+        }
+        QProgressBar::chunk {
+            background-color: #3daee9;
+            border-radius: 6px;
+        }
+        """
+
+    def _apply_theme(self):
+        app = QApplication.instance()
+        if app is not None:
+            f = app.font()
+            if f.pointSize() <= 0:
+                f.setPointSize(10)
+                app.setFont(f)
+            for w in self.findChildren(QWidget):
+                wf = w.font()
+                if wf.pointSize() <= 0:
+                    wf.setPointSize(10)
+                    w.setFont(wf)
+
+        self._dark = is_dark_mode(QApplication.instance())
+        self._btn_css = build_btn_css(self._dark)
+
+        for btn in self.findChildren(QPushButton):
+            btn.setStyleSheet(self._btn_css)
+            btn.setCursor(Qt.PointingHandCursor)
+        for chk in self.findChildren(QCheckBox):
+            chk.setCursor(Qt.PointingHandCursor)
+        for combo in self.findChildren(QComboBox):
+            combo.setStyleSheet(self._btn_css)
+
+        if hasattr(self, "scene_view"):
+            self.scene_view.setStyleSheet(build_scrollbar_css(self._dark))
+            self.scene_view.setCursor(Qt.PointingHandCursor)
+        if hasattr(self, "card_header"):
+            self.card_header.setStyleSheet(self._card_header_css(self._dark))
+        if hasattr(self, "progress"):
+            self.progress.setStyleSheet(self._progress_css(self._dark))
+        if hasattr(self, "vline"):
+            if self._dark:
+                self.vline.setStyleSheet("color: rgba(255,255,255,0.14);")
+            else:
+                self.vline.setStyleSheet("color: rgba(0,0,0,0.18);")
+
+        if hasattr(self, "status"):
+            self.status.setStyleSheet("font-size: 10pt;")
+        if hasattr(self, "info_label"):
+            if self._dark:
+                self.info_label.setStyleSheet("color: #aaa; font-size: 9pt;")
+            else:
+                self.info_label.setStyleSheet("font-size: 9pt;")
+
+        for name, color in (
+            ("total_scene_label", "#aaa"),
+            ("selection_info", "#aaa"),
+            ("page_label", "#aaa"),
+            ("page_size_label", "#777"),
+            ("dep_selected", "#bbb"),
+            ("dep_summary", "#aaa"),
+        ):
+            lbl = getattr(self, name, None)
+            if isinstance(lbl, QLabel):
+                self._set_dim_label(lbl, color)
+        if hasattr(self, "dep_title"):
+            if self._dark:
+                self.dep_title.setStyleSheet("font-weight: bold; font-size: 11pt; color: #eee;")
+            else:
+                self.dep_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
+
+        if hasattr(self, "dep_container"):
+            for row in self.dep_container.findChildren(DependencyRow):
+                row.set_theme(self._dark)
+
+        if getattr(self, "selection_dirty", False):
+            self.set_apply_attention(True)
+        else:
+            self._apply_btn_normal_style()
+
+    def changeEvent(self, event):  # type: ignore[override]
+        if event.type() in (QEvent.PaletteChange, QEvent.StyleChange):
+            try:
+                self._apply_theme()
+            except Exception:
+                pass
+        super().changeEvent(event)
     def __init__(self):
         super().__init__()
 
@@ -1957,6 +2099,7 @@ class MainWindow(QWidget):
         self.left_layout.addLayout(row_head)
 
         self.status = QLabel("Starting...")
+        self.status.setStyleSheet("font-size: 10pt;")
         self.left_layout.addWidget(self.status)
 
 
@@ -1965,8 +2108,11 @@ class MainWindow(QWidget):
 
         self.left_layout.addLayout(self.apply_row)
 
-        self.info_label = QLabel("Total VARs: - | Unused VARs: - | Scenes: -")
-        self._set_dim_label(self.info_label, "#aaa")
+        self.info_label = QLabel("Total VARs: - | Scenes: -")
+        if self._dark:
+                self.info_label.setStyleSheet("color: #aaa; font-size: 9pt;")
+        else:
+                self.info_label.setStyleSheet("font-size: 9pt;")
 
         self.left_layout.addWidget(self.info_label)
 
@@ -1974,18 +2120,7 @@ class MainWindow(QWidget):
 
         self.progress = QProgressBar()
         self.progress.setMinimumHeight(20)
-        self.progress.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid rgba(255,255,255,0.25);
-                border-radius: 6px;
-                background-color: rgba(255,255,255,0.08);
-                text-align: center;
-            }
-            QProgressBar::chunk {
-                background-color: #3daee9;
-                border-radius: 6px;
-            }
-        """)
+        self.progress.setStyleSheet(self._progress_css(self._dark))
         self.progress.setVisible(False)
         self.left_layout.addWidget(self.progress)
 
@@ -2017,7 +2152,7 @@ class MainWindow(QWidget):
 
         ctl_left_lay.addLayout(row_top)
 
-        self.btn_restore = QPushButton("Restore VARs Manually")
+        self.btn_restore = QPushButton("Restore Disabled VARs")
         self.btn_restore.setStyleSheet(self._btn_css)
         self.btn_restore.setEnabled(False)
         self.btn_restore.clicked.connect(self.restore_offloaded_vars)
@@ -2066,10 +2201,13 @@ class MainWindow(QWidget):
 
         ctl_left_lay.addLayout(row_launch)
 
-        vline = QFrame()
-        vline.setFrameShape(QFrame.VLine)
-        vline.setFrameShadow(QFrame.Sunken)
-        vline.setStyleSheet("color: rgba(255,255,255,0.14);")
+        self.vline = QFrame()
+        self.vline.setFrameShape(QFrame.VLine)
+        self.vline.setFrameShadow(QFrame.Sunken)
+        if self._dark:
+            self.vline.setStyleSheet("color: rgba(255,255,255,0.14);")
+        else:
+            self.vline.setStyleSheet("color: rgba(0,0,0,0.18);")
 
         ctl_right = QWidget()
         ctl_right_lay = QVBoxLayout(ctl_right)
@@ -2086,7 +2224,8 @@ class MainWindow(QWidget):
         self.preset_combo = QComboBox()
         self.preset_combo.addItems([f"Scene Selection Preset {i}" for i in range(1, self.MAX_PRESETS + 1)])
 
-        self.preset_combo.setMinimumHeight(30)
+        self.preset_combo.setMinimumHeight(32)
+        self.preset_combo.setStyleSheet(self._btn_css)
         row_preset.addWidget(self.preset_combo, 1)
 
         self.btn_save_preset = QPushButton("Save")
@@ -2103,7 +2242,7 @@ class MainWindow(QWidget):
         ctl_right_lay.addStretch(1)
 
         row_controls.addWidget(ctl_left, 3)
-        row_controls.addWidget(vline, 0)
+        row_controls.addWidget(self.vline, 0)
         row_controls.addWidget(ctl_right, 2)
 
         self.left_layout.addLayout(row_controls)
@@ -2111,9 +2250,20 @@ class MainWindow(QWidget):
         self.left_layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Fixed))
         self.left_layout.addItem(QSpacerItem(0, 20, QSizePolicy.Minimum, QSizePolicy.Fixed))
 
-        self.selection_info = QLabel("Total Scene: 0 scenes | Selected Scene: 0 scenes")
+        self.scene_count_row = QHBoxLayout()
+        self.scene_count_row.setContentsMargins(0, 0, 0, 0)
+        self.scene_count_row.setSpacing(8)
+
+        self.total_scene_label = QLabel("Total Scene: 0 scenes")
+        self._set_dim_label(self.total_scene_label, "#aaa")
+        self.scene_count_row.addWidget(self.total_scene_label, 0)
+        self.scene_count_row.addStretch(1)
+
+        self.selection_info = QLabel("Selected Scene: 0 scenes")
         self._set_dim_label(self.selection_info, "#aaa")
-        self.left_layout.addWidget(self.selection_info)
+        self.scene_count_row.addWidget(self.selection_info, 0)
+
+        self.left_layout.addLayout(self.scene_count_row)
 
         row_search = QHBoxLayout()
         self.search = QLineEdit()
@@ -2155,13 +2305,7 @@ class MainWindow(QWidget):
         self.left_layout.addWidget(self.page_controls)
 
         self.card_header = QWidget()
-        self.card_header.setStyleSheet("""
-            QWidget {
-                background: rgba(255,255,255,0.03);
-                border: 1px solid rgba(255,255,255,0.08);
-                border-radius: 8px;
-            }
-        """)
+        self.card_header.setStyleSheet(self._card_header_css(self._dark))
         header_layout = QHBoxLayout(self.card_header)
         header_layout.setContentsMargins(10, 8, 10, 8)
         header_layout.setSpacing(8)
@@ -2178,18 +2322,17 @@ class MainWindow(QWidget):
         self.btn_clear_sel.setStyleSheet(self._btn_css)
         header_layout.addWidget(self.btn_clear_sel)
 
-        self.btn_preload_previews = QPushButton("Preload Previews")
-        self.btn_preload_previews.setEnabled(False)
-        self.btn_preload_previews.clicked.connect(self._on_preload_previews_clicked)
-        self.btn_preload_previews.setStyleSheet(self._btn_css)
-        header_layout.addWidget(self.btn_preload_previews)
-
         header_layout.addStretch(1)
 
         self.chk_girl_looks_only = QCheckBox('Show Girl "Looks" Only')
         self.chk_girl_looks_only.setEnabled(False)
         self.chk_girl_looks_only.stateChanged.connect(self.on_toggle_looks_only)
         header_layout.addWidget(self.chk_girl_looks_only)
+
+        self.chk_selected_only = QCheckBox("Show Selected Only")
+        self.chk_selected_only.setEnabled(False)
+        self.chk_selected_only.stateChanged.connect(lambda _v: self.apply_filter(self.search.text()))
+        header_layout.addWidget(self.chk_selected_only)
 
         self.left_layout.addWidget(self.card_header)
 
@@ -2226,7 +2369,7 @@ class MainWindow(QWidget):
         self.right_layout.setSpacing(8)
 
         self.dep_title = QLabel("Dependencies")
-        self.dep_title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        self.dep_title.setStyleSheet("font-weight: bold; font-size: 11pt;")
         self.right_layout.addWidget(self.dep_title)
 
         self.dep_selected = QLabel('Click a card to see dependencies.\n(Selection mode: click selects)')
@@ -2264,6 +2407,7 @@ class MainWindow(QWidget):
 
         self.refresh_preset_combo_names()
 
+        self._apply_theme()
         self._maybe_show_welcome_once()
         QTimer.singleShot(0, self._startup_sequence)
 
@@ -2492,6 +2636,7 @@ class MainWindow(QWidget):
         self.cfg["last_preset"] = idx
         save_config(self.cfg)
 
+        self.apply_filter(self.search.text())
         QMessageBox.information(self, "Preset Loaded", f"Loaded Preset {idx}")
 
 
@@ -2741,7 +2886,7 @@ class MainWindow(QWidget):
                 QMessageBox.information(self, "Busy", "Please wait for current loading/refresh to finish.")
                 return
 
-            self.loading.start("Checking Update", "Contacting GitHub...")
+            self.loading.start("Checking Update", "Please wait...")
 
             info = self._http_get_json(GITHUB_LATEST_API)
             tag = str(info.get("tag_name") or "").strip()
@@ -2964,11 +3109,12 @@ class MainWindow(QWidget):
             self._set_var_deps_cache_from_cache(cache_obj)
             self._recompute_unused_count_from_scene_entries()
 
-            self.status.setText(f"VaM Directory:\n{self.vam_dir}\n(Loaded from cache)")
+            self.status.setText(f"VaM Directory:\n{self.vam_dir}")
 
             self.search.setEnabled(True)
             self.chk_girl_looks_only.setEnabled(True)
             self.chk_select_mode.setEnabled(True)
+            self.chk_selected_only.setEnabled(self.is_selection_mode())
 
         self._start_change_check(cache_obj)
 
@@ -3013,11 +3159,12 @@ class MainWindow(QWidget):
             self._set_var_deps_cache_from_cache(cache_obj)
             self._recompute_unused_count_from_scene_entries()
 
-            self.status.setText(f"VaM Directory:\n{self.vam_dir}\n(Loaded from cache. Checking updates...)")
+            self.status.setText(f"VaM Directory:\n{self.vam_dir}")
 
             self.search.setEnabled(True)
             self.chk_girl_looks_only.setEnabled(True)
             self.chk_select_mode.setEnabled(True)
+            self.chk_selected_only.setEnabled(self.is_selection_mode())
 
             self.populate_scene_cards_from_entries()
             self.apply_filter(self.search.text())
@@ -3142,7 +3289,7 @@ class MainWindow(QWidget):
         self._unused_req_id += 1
         self.unused_vars_count = 0
         self.info_label.setText(
-            f"Total VARs: {self.total_vars_count} | Unused VARs: - | Scenes: {self.total_scene_files_found}"
+            f"Total VARs: {self.total_vars_count} | Scenes: {self.total_scene_files_found}"
         )
 
     def _start_unused_count_worker(self):
@@ -3153,7 +3300,7 @@ class MainWindow(QWidget):
         req_id = self._unused_req_id
 
         self.info_label.setText(
-            f"Total VARs: {self.total_vars_count} | Unused VARs: calculating... | Scenes: {self.total_scene_files_found}"
+            f"Total VARs: {self.total_vars_count} | Scenes: {self.total_scene_files_found}"
         )
 
         self._unused_worker = UnusedCountWorker(self.addon_dir, scene_vars, self._var_deps_cache)
@@ -3165,7 +3312,7 @@ class MainWindow(QWidget):
             return
         self.unused_vars_count = max(0, int(count))
         self.info_label.setText(
-            f"Total VARs: {self.total_vars_count} | Unused VARs: {self.unused_vars_count} | Scenes: {self.total_scene_files_found}"
+            f"Total VARs: {self.total_vars_count} | Scenes: {self.total_scene_files_found}"
         )
 
     # ======================
@@ -3204,7 +3351,7 @@ class MainWindow(QWidget):
         self.loading.start("Loading", "Scanning scenes...")
 
         self.status.setText("Scanning scenes...")
-        self.info_label.setText("Total VARs: - | Unused VARs: - | Scenes: -")
+        self.info_label.setText("Total VARs: - | Scenes: -")
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
 
@@ -3215,6 +3362,8 @@ class MainWindow(QWidget):
         self.search.setText("")
         self.chk_girl_looks_only.setEnabled(False)
         self.chk_girl_looks_only.setChecked(False)
+        self.chk_selected_only.setEnabled(False)
+        self.chk_selected_only.setChecked(False)
 
         self.selected_scene_vars.clear()
         self.update_selection_ui()
@@ -3252,6 +3401,7 @@ class MainWindow(QWidget):
         self.search.setEnabled(True)
         self.chk_girl_looks_only.setEnabled(True)
         self.chk_select_mode.setEnabled(True)
+        self.chk_selected_only.setEnabled(self.is_selection_mode())
 
         self.populate_scene_cards_from_entries()
         self.apply_filter(self.search.text())
@@ -3512,8 +3662,9 @@ class MainWindow(QWidget):
 
         self._preload_index = 0
         if self._preload_rows:
-            self.btn_preload_previews.setText("Preloading...")
-            self.btn_preload_previews.setEnabled(False)
+            if hasattr(self, "btn_preload_previews"):
+                self.btn_preload_previews.setText("Preloading...")
+                self.btn_preload_previews.setEnabled(False)
             if not self._preload_status_base:
                 self._preload_status_base = self.status.text()
             self.status.setText(f"{self._preload_status_base}\nPreloading previews...")
@@ -3667,6 +3818,7 @@ class MainWindow(QWidget):
     def _apply_filter_and_pagination(self, text: str):
         q = (text or "").strip().lower()
         looks_only = self.chk_girl_looks_only.isChecked()
+        selected_only = self.chk_selected_only.isChecked()
 
         self._stop_preload_all_previews()
 
@@ -3682,6 +3834,12 @@ class MainWindow(QWidget):
                     continue
                 looks_val = e.get("is_girl_looks")
                 if looks_val is None or not bool(looks_val):
+                    continue
+            if selected_only:
+                if e.get("source", "var") != "var":
+                    continue
+                vname = str(e.get("var_name", ""))
+                if not vname or (vname not in self.selected_scene_vars):
                     continue
             filtered.append(e)
 
@@ -3857,19 +4015,23 @@ class MainWindow(QWidget):
 
 
     def update_selection_ui(self):
-        self.selection_info.setText(
-            f"Total Scene: {self.total_scene_files_found} scenes | Selected Scene: {len(self.selected_scene_vars)} scenes"
-        )
+        self.total_scene_label.setText(f"Total Scene: {self.total_scene_files_found} scenes")
+        self.selection_info.setText(f"Selected Scene: {len(self.selected_scene_vars)} scenes")
 
         has_scenes = (self.addon_dir is not None) and (self.scene_model.rowCount() > 0)
+        has_any_scenes = (self.addon_dir is not None) and (len(self.scene_entries) > 0)
         enabled_card_tools = self.is_selection_mode() and has_scenes
         self.btn_select_all.setEnabled(enabled_card_tools)
         self.btn_clear_sel.setEnabled(enabled_card_tools)
 
-        self.btn_save_preset.setEnabled(enabled_card_tools)
-        self.btn_load_preset.setEnabled(enabled_card_tools)
-        self.preset_combo.setEnabled(enabled_card_tools)
-        self.btn_preload_previews.setEnabled(has_scenes and not self._preload_timer.isActive())
+        preset_enabled = self.is_selection_mode() and has_any_scenes
+        self.btn_save_preset.setEnabled(preset_enabled)
+        self.btn_load_preset.setEnabled(preset_enabled)
+        self.preset_combo.setEnabled(preset_enabled)
+        selected_only_enabled = self.is_selection_mode() and has_any_scenes
+        self.chk_selected_only.setEnabled(selected_only_enabled)
+        if not selected_only_enabled and self.chk_selected_only.isChecked():
+            self.chk_selected_only.setChecked(False)
 
     def select_all_visible(self):
         if self.scene_model.rowCount() == 0:
@@ -3901,6 +4063,7 @@ class MainWindow(QWidget):
                 self._set_var_selected(var_name, False)
         finally:
             self._end_batch_selection()
+        self.apply_filter(self.search.text())
 
 
     def on_scene_clicked(self, proxy_index: QModelIndex):
@@ -3927,6 +4090,31 @@ class MainWindow(QWidget):
 
         self.scene_model.set_active_row(row)
         self.show_loose_scene_info(item)
+
+    def closeEvent(self, event):  # type: ignore[override]
+        # Ensure background threads are stopped before exit.
+        try:
+            self._stop_all_preview_loaders()
+        except Exception:
+            pass
+        for tname in ("worker", "change_worker", "looks_worker", "_unused_worker"):
+            t = getattr(self, tname, None)
+            if t is None:
+                continue
+            try:
+                if t.isRunning():
+                    t.requestInterruption()
+                    t.quit()
+                    t.wait(2000)
+            except Exception:
+                pass
+        if hasattr(self, "_preload_timer") and self._preload_timer.isActive():
+            self._preload_timer.stop()
+        if hasattr(self, "_preview_schedule_timer") and self._preview_schedule_timer.isActive():
+            self._preview_schedule_timer.stop()
+        if hasattr(self, "poll_timer") and self.poll_timer.isActive():
+            self.poll_timer.stop()
+        super().closeEvent(event)
 
     # ======================
     # Dependencies panel
@@ -4007,7 +4195,7 @@ class MainWindow(QWidget):
                 missing_count += 1
                 text = f"{dep}  →  (missing)"
 
-            self.dep_list_layout.addWidget(DependencyRow(text=text, present=present))
+            self.dep_list_layout.addWidget(DependencyRow(text=text, present=present, dark=self._dark))
 
         self.dep_list_layout.addStretch(1)
         self.dep_summary.setText(f"Total: {len(deps)} | Present: {present_count} | Missing: {missing_count}")
@@ -4631,6 +4819,10 @@ class MainWindow(QWidget):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    f = app.font()
+    if f.pointSize() <= 0:
+        f.setPointSize(10)
+        app.setFont(f)
 
     icon_path = resource_path("icons/app.ico")
     if icon_path.exists():
