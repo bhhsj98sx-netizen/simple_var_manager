@@ -4,10 +4,12 @@ import os
 import sys
 import json
 import subprocess
+import shutil
 import zipfile
 import time
 import hashlib
 import urllib.request
+import ssl
 import re
 import tempfile
 import queue
@@ -17,11 +19,15 @@ import itertools
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+try:
+    import certifi
+except Exception:
+    certifi = None
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton,
     QVBoxLayout, QFileDialog, QProgressBar, QMessageBox,
-    QScrollArea, QLineEdit, QListView,
+    QScrollArea, QLineEdit, QListView, QListWidget, QListWidgetItem, QTabWidget,
     QHBoxLayout, QFrame, QCheckBox, QDialog, QTextEdit, QComboBox, QTextBrowser,
     QSpacerItem, QSizePolicy, QInputDialog, QStyledItemDelegate, QStyle
 )
@@ -48,7 +54,7 @@ def resource_path(rel_path: str) -> Path:
 # ======================
 # App version + Updater (GitHub Releases)
 # ======================
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.1"
 
 GITHUB_OWNER = "bhhsj98sx-netizen"
 GITHUB_REPO = "simple_var_manager"
@@ -157,6 +163,10 @@ When you close <b>VaM.exe</b>, all renamed files will automatically restore back
     After clicking this button, you may need to use VaM’s
     <b>refresh / rescan packages</b> button inside the game.
   </li>
+  <li>
+    <b>Whitelist VARs</b><br>
+    Move selected .var files into <b>AddonPackages/Whitelist</b> so they are never disabled.
+  </li>
 </ul>
 
 <hr>
@@ -176,7 +186,7 @@ select them again next time.
 # App data dir (IMPORTANT for --onefile)
 # ======================
 APP_VENDOR = "LQuest"
-APP_NAME = "VaM Simple VAR Manager"
+APP_NAME = "VaM Scene Companion"
 
 def app_data_dir() -> Path:
     base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
@@ -697,7 +707,7 @@ def fast_list_vars(addon_dir: Path) -> list[Path]:
         out = list(addon_dir.rglob("*.var"))
     return out
 
-def fast_list_vars_all_states(addon_dir: Path) -> list[tuple[str, Path]]:
+def fast_list_vars_all_states(addon_dir: Path, exclude_dir_names: set[str] | None = None) -> list[tuple[str, Path]]:
     """
     Returns list of (orig_var_name, actual_path) for:
     - *.var
@@ -705,11 +715,14 @@ def fast_list_vars_all_states(addon_dir: Path) -> list[tuple[str, Path]]:
     """
     out: list[tuple[str, Path]] = []
     seen: set[str] = set()
+    exclude = {d.lower() for d in (exclude_dir_names or set())}
     try:
         has_dirs = False
         with os.scandir(addon_dir) as it:
             for e in it:
                 if e.is_dir():
+                    if e.name.lower() in exclude:
+                        continue
                     has_dirs = True
                     continue
                 if not e.is_file():
@@ -726,7 +739,9 @@ def fast_list_vars_all_states(addon_dir: Path) -> list[tuple[str, Path]]:
                         seen.add(e.path)
                         out.append((orig, Path(e.path)))
         if has_dirs:
-            for root, _dirs, files in os.walk(addon_dir):
+            for root, dirs, files in os.walk(addon_dir):
+                if exclude:
+                    dirs[:] = [d for d in dirs if d.lower() not in exclude]
                 for fname in files:
                     low = fname.lower()
                     if low.endswith(".var"):
@@ -744,11 +759,18 @@ def fast_list_vars_all_states(addon_dir: Path) -> list[tuple[str, Path]]:
                         out.append((orig, Path(fp)))
     except Exception:
         # fallback (slower)
-        for p in addon_dir.rglob("*.var"):
-            out.append((p.name, p))
-        for p in addon_dir.rglob("*.var.disabled"):
-            orig = p.name[:-len(DISABLED_SUFFIX)]
-            out.append((orig, p))
+        for root, dirs, files in os.walk(addon_dir):
+            if exclude:
+                dirs[:] = [d for d in dirs if d.lower() not in exclude]
+            for fname in files:
+                low = fname.lower()
+                if low.endswith(".var"):
+                    fp = os.path.join(root, fname)
+                    out.append((fname, Path(fp)))
+                elif low.endswith(".var.disabled"):
+                    fp = os.path.join(root, fname)
+                    orig = fname[:-len(DISABLED_SUFFIX)]
+                    out.append((orig, Path(fp)))
     return out
 
 
@@ -818,12 +840,14 @@ def _should_count_loose_scene(relp: str) -> bool:
 # Disable-by-rename helpers
 # ======================
 DISABLED_SUFFIX = ".disabled"
+WHITELIST_DIR_NAME = "Whitelist"
 
 def disabled_name(original: str) -> str:
     return original + DISABLED_SUFFIX
 
 def manifest_path_for(vam_dir: Path) -> Path:
     return vam_dir / "_vam_temp_manifest.json"
+
 
 
 # ======================
@@ -946,7 +970,7 @@ class DonationDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Support VSVM")
+        self.setWindowTitle("Support VaM Scene Companion")
         self.resize(520, 360)
 
         layout = QVBoxLayout(self)
@@ -1007,7 +1031,7 @@ class WelcomeDialog(QDialog):
         layout = QVBoxLayout(self)
 
         html = (
-            "<h3>Welcome to VaM Simple VAR Manager</h3>"
+            "<h3>Welcome to VaM Scene Companion</h3>"
             "<p>"
             "I made this tool for free to help improve your VaM experience.<br><br>"
             "If you find it useful, you can support me on Patreon so I can keep making updates and new tools.<br><br>"
@@ -1032,6 +1056,101 @@ class WelcomeDialog(QDialog):
         row.addWidget(close)
 
         layout.addLayout(row)
+
+
+# ======================
+# Whitelist selection dialog
+# ======================
+class WhitelistSelectDialog(QDialog):
+    def __init__(self, available_names: list[str], whitelisted_names: list[str], parent=None, initial_tab: int = 0):
+        super().__init__(parent)
+        self.setWindowTitle("Whitelist VARs")
+        self.resize(560, 560)
+
+        root = QVBoxLayout(self)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search var name / creator...")
+        root.addWidget(self.search)
+
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+
+        self.list_available = QListWidget()
+        self.list_available.setSelectionMode(QListWidget.NoSelection)
+        for name in available_names:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Unchecked)
+            self.list_available.addItem(item)
+        self.tabs.addTab(self.list_available, "Not Whitelisted")
+
+        self.list_whitelisted = QListWidget()
+        self.list_whitelisted.setSelectionMode(QListWidget.NoSelection)
+        for name in whitelisted_names:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.list_whitelisted.addItem(item)
+        self.tabs.addTab(self.list_whitelisted, "Whitelisted")
+
+        row = QHBoxLayout()
+        self.btn_remove_all = QPushButton("Remove all from whitelist")
+        self.btn_remove_all.clicked.connect(self._remove_all_whitelisted)
+        row.addWidget(self.btn_remove_all)
+        row.addStretch(1)
+
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        row.addWidget(btn_cancel)
+
+        btn_save = QPushButton("Save")
+        btn_save.clicked.connect(self.accept)
+        row.addWidget(btn_save)
+
+        root.addLayout(row)
+
+        self.search.textChanged.connect(self._apply_filter)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        if initial_tab in (0, 1):
+            self.tabs.setCurrentIndex(initial_tab)
+        self._on_tab_changed(self.tabs.currentIndex())
+
+    def _current_list(self) -> QListWidget:
+        return self.list_whitelisted if self.tabs.currentIndex() == 1 else self.list_available
+
+    def _on_tab_changed(self, _index: int):
+        self.btn_remove_all.setVisible(self.tabs.currentIndex() == 1)
+        self._apply_filter(self.search.text())
+
+    def _remove_all_whitelisted(self):
+        for i in range(self.list_whitelisted.count()):
+            item = self.list_whitelisted.item(i)
+            item.setCheckState(Qt.Unchecked)
+
+    def _apply_filter(self, text: str):
+        q = (text or "").strip().lower()
+        lst = self._current_list()
+        for i in range(lst.count()):
+            item = lst.item(i)
+            name = item.text().lower()
+            item.setHidden(bool(q) and q not in name)
+
+    def selected_available(self) -> list[str]:
+        out: list[str] = []
+        for i in range(self.list_available.count()):
+            item = self.list_available.item(i)
+            if item.checkState() == Qt.Checked:
+                out.append(item.text())
+        return out
+
+    def selected_whitelisted(self) -> list[str]:
+        out: list[str] = []
+        for i in range(self.list_whitelisted.count()):
+            item = self.list_whitelisted.item(i)
+            if item.checkState() == Qt.Checked:
+                out.append(item.text())
+        return out
 
 
 # ======================
@@ -1947,12 +2066,12 @@ class MainWindow(QWidget):
         super().__init__()
 
         _ = app_data_dir()
+        self.cfg = load_config()
+        self._one_time_cache_reset()
         _ = previews_dir()
 
-        self.setWindowTitle("VaM Simple VAR Manager v1.1.0")
+        self.setWindowTitle("VaM Scene Companion v1.2.1")
         self.resize(1220, 780)
-
-        self.cfg = load_config()
 
         self.vam_dir: Path | None = None
         self.addon_dir: Path | None = None
@@ -2010,6 +2129,12 @@ class MainWindow(QWidget):
         self._apply_attention_timer.setInterval(450)
         self._apply_attention_timer.timeout.connect(self._tick_apply_attention)
         self._apply_attention_on = False
+
+        self._scene_select_glow_timer = QTimer(self)
+        self._scene_select_glow_timer.setInterval(500)
+        self._scene_select_glow_timer.timeout.connect(self._tick_scene_select_glow)
+        self._scene_select_glow_on = False
+        self._scene_select_glow_done_session = False
 
                 # ---- selection dirty debounce (prevents UI freeze during batch/preset load)
         self._dirty_check_timer = QTimer(self)
@@ -2217,13 +2342,11 @@ class MainWindow(QWidget):
         self.chk_select_mode = QCheckBox("Enable Scene Selection")
         self.chk_select_mode.stateChanged.connect(self.on_toggle_selection_mode)
         self.chk_select_mode.setEnabled(False)
-        ctl_right_lay.addWidget(self.chk_select_mode, 0)
 
         row_preset = QHBoxLayout()
         self.MAX_PRESETS = 5  
         self.preset_combo = QComboBox()
         self.preset_combo.addItems([f"Scene Selection Preset {i}" for i in range(1, self.MAX_PRESETS + 1)])
-
         self.preset_combo.setMinimumHeight(32)
         self.preset_combo.setStyleSheet(self._btn_css)
         row_preset.addWidget(self.preset_combo, 1)
@@ -2239,7 +2362,34 @@ class MainWindow(QWidget):
         row_preset.addWidget(self.btn_load_preset, 0)
 
         ctl_right_lay.addLayout(row_preset)
+
+        row_whitelist = QHBoxLayout()
+        row_whitelist.setSpacing(8)
+        self.btn_whitelist_add = QPushButton("Whitelist VARs")
+        self.btn_whitelist_add.setToolTip("Move selected .var files into AddonPackages/Whitelist so they are never disabled.")
+        self.btn_whitelist_add.setStyleSheet(self._btn_css)
+        self.btn_whitelist_add.setEnabled(True)
+        self.btn_whitelist_add.clicked.connect(self.add_vars_to_whitelist)
+        row_whitelist.addWidget(self.btn_whitelist_add, 1)
+
+        ctl_right_lay.addLayout(row_whitelist)
         ctl_right_lay.addStretch(1)
+
+        uniform_h = 34
+        for btn in (
+            self.btn_refresh,
+            self.btn_select,
+            self.btn_restore,
+            self.btn_apply_now,
+            self.btn_launch_vam,
+            self.btn_launch_vd,
+            self.btn_launch_launcher,
+            self.btn_save_preset,
+            self.btn_load_preset,
+            self.btn_whitelist_add,
+        ):
+            btn.setMinimumHeight(uniform_h)
+        self.preset_combo.setMinimumHeight(uniform_h)
 
         row_controls.addWidget(ctl_left, 3)
         row_controls.addWidget(self.vline, 0)
@@ -2262,6 +2412,12 @@ class MainWindow(QWidget):
         self.selection_info = QLabel("Selected Scene: 0 scenes")
         self._set_dim_label(self.selection_info, "#aaa")
         self.scene_count_row.addWidget(self.selection_info, 0)
+
+        row_select_mode = QHBoxLayout()
+        row_select_mode.setContentsMargins(0, 0, 0, 0)
+        row_select_mode.addWidget(self.chk_select_mode, 0, Qt.AlignLeft)
+        row_select_mode.addStretch(1)
+        self.left_layout.addLayout(row_select_mode)
 
         self.left_layout.addLayout(self.scene_count_row)
 
@@ -2403,11 +2559,13 @@ class MainWindow(QWidget):
         self.refresh_refresh_button()
         self.refresh_restore_button()
         self.refresh_apply_button()
+        self.refresh_whitelist_buttons()
         self.update_selection_ui()
 
         self.refresh_preset_combo_names()
 
         self._apply_theme()
+        self._start_scene_select_glow()
         self._maybe_show_welcome_once()
         QTimer.singleShot(0, self._startup_sequence)
 
@@ -2497,6 +2655,49 @@ class MainWindow(QWidget):
                 self._apply_attention_timer.stop()
             self._apply_btn_normal_style()
 
+    def _scene_select_glow_style(self, phase: bool) -> str:
+        if phase:
+            return """
+                QCheckBox::indicator {
+                    width: 16px;
+                    height: 16px;
+                    border: 2px solid rgba(255, 215, 64, 0.95);
+                    background-color: rgba(255, 215, 64, 0.25);
+                    border-radius: 4px;
+                }
+            """
+        return """
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 2px solid rgba(255, 215, 64, 0.55);
+                background-color: rgba(255, 215, 64, 0.12);
+                border-radius: 4px;
+            }
+        """
+
+    def _tick_scene_select_glow(self):
+        if self._scene_select_glow_done_session:
+            self._stop_scene_select_glow()
+            return
+        self._scene_select_glow_on = not self._scene_select_glow_on
+        self.chk_select_mode.setStyleSheet(self._scene_select_glow_style(self._scene_select_glow_on))
+
+    def _start_scene_select_glow(self):
+        if self._scene_select_glow_done_session:
+            return
+        if self.chk_select_mode.isChecked():
+            self._scene_select_glow_done_session = True
+            return
+        if not self._scene_select_glow_timer.isActive():
+            self._scene_select_glow_on = False
+            self._scene_select_glow_timer.start()
+
+    def _stop_scene_select_glow(self):
+        if self._scene_select_glow_timer.isActive():
+            self._scene_select_glow_timer.stop()
+        self.chk_select_mode.setStyleSheet("")
+
     
     def _preset_key(self, idx: int) -> str:
         return f"preset_{idx}"
@@ -2535,6 +2736,181 @@ class MainWindow(QWidget):
 
         return {name for (name, _p) in fast_list_vars_all_states(self.addon_dir)}
 
+    # ======================
+    # Whitelist helpers
+    # ======================
+    def _whitelist_dir(self) -> Path | None:
+        if not self.addon_dir:
+            return None
+        return self.addon_dir / WHITELIST_DIR_NAME
+
+    def _ensure_whitelist_dir(self) -> Path | None:
+        p = self._whitelist_dir()
+        if not p:
+            return None
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return None
+        return p
+
+    def _is_path_in_whitelist(self, path: Path) -> bool:
+        p = self._whitelist_dir()
+        if not p:
+            return False
+        try:
+            pp = path.resolve()
+            wp = p.resolve()
+            return pp == wp or wp in pp.parents
+        except Exception:
+            return False
+
+    def whitelist_var_names(self) -> set[str]:
+        p = self._whitelist_dir()
+        if not p or not p.exists():
+            return set()
+        names: set[str] = set()
+        for root, _dirs, files in os.walk(p):
+            for fname in files:
+                low = fname.lower()
+                if low.endswith(".var"):
+                    names.add(fname)
+                elif low.endswith(".var.disabled"):
+                    names.add(fname[:-len(DISABLED_SUFFIX)])
+        return names
+
+    def _find_in_whitelist(self, var_name: str) -> Path | None:
+        p = self._whitelist_dir()
+        if not p or not p.exists():
+            return None
+        target = var_name
+        if not target.lower().endswith(".var"):
+            target = f"{target}.var"
+        target_low = target.lower()
+        disabled_low = (target + DISABLED_SUFFIX).lower()
+        for root, _dirs, files in os.walk(p):
+            for fname in files:
+                low = fname.lower()
+                if low == target_low or low == disabled_low:
+                    return Path(root) / fname
+        return None
+
+    def _path_under_root(self, path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except Exception:
+            return False
+
+    def refresh_whitelist_buttons(self):
+        self.btn_whitelist_add.setEnabled(True)
+
+    def _whitelist_edit_allowed(self) -> bool:
+        if not self.vam_dir or not self.addon_dir:
+            QMessageBox.warning(self, "No folder", "Select VaM directory first.")
+            return False
+        if manifest_path_for(self.vam_dir).exists():
+            QMessageBox.warning(
+                self,
+                "Restore first",
+                "Restore Disabled VARs first (lean session active), then edit the whitelist."
+            )
+            return False
+        return True
+
+    def _open_whitelist_dialog(self, initial_tab: int = 0):
+        if not self._whitelist_edit_allowed():
+            return
+        whitelist_dir = self._ensure_whitelist_dir()
+        if not whitelist_dir:
+            QMessageBox.warning(self, "Error", "Failed to create Whitelist folder.")
+            return
+
+        if not self.addon_dir:
+            QMessageBox.warning(self, "No folder", "Select VaM directory first.")
+            return
+
+        whitelisted = set(self.whitelist_var_names())
+        available = set(
+            name for (name, _p) in fast_list_vars_all_states(
+                self.addon_dir, exclude_dir_names={WHITELIST_DIR_NAME}
+            )
+        )
+        available -= whitelisted
+
+        if not available and not whitelisted:
+            QMessageBox.information(self, "Whitelist", "No VARs found.")
+            return
+
+        dlg = WhitelistSelectDialog(sorted(available), sorted(whitelisted), self, initial_tab=initial_tab)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        add_names = set(dlg.selected_available())
+        keep_names = set(dlg.selected_whitelisted())
+        remove_names = whitelisted - keep_names
+
+        add_moved = 0
+        remove_moved = 0
+        skipped: list[str] = []
+
+        for name in remove_names:
+            p = self._find_in_whitelist(name)
+            if not p or not p.exists():
+                skipped.append(name)
+                continue
+            dst_name = name
+            if not dst_name.lower().endswith(".var"):
+                dst_name = f"{dst_name}.var"
+            dst = self.addon_dir / dst_name
+            if dst.exists():
+                skipped.append(name)
+                continue
+            try:
+                shutil.move(str(p), str(dst))
+                remove_moved += 1
+            except Exception:
+                skipped.append(name)
+
+        for name in add_names:
+            p = self.get_var_existing_path(name)
+            if not p or not p.exists():
+                skipped.append(name)
+                continue
+            if self._is_path_in_whitelist(p):
+                skipped.append(name)
+                continue
+
+            dst_name = name
+            if not dst_name.lower().endswith(".var"):
+                dst_name = f"{dst_name}.var"
+
+            dst = whitelist_dir / dst_name
+            if dst.exists():
+                skipped.append(name)
+                continue
+
+            try:
+                shutil.move(str(p), str(dst))
+                add_moved += 1
+            except Exception:
+                skipped.append(name)
+
+        if add_moved or remove_moved:
+            self.refresh_clicked()
+
+        msg = f"Whitelisted {add_moved} VAR(s)."
+        msg += f"\nRemoved {remove_moved} VAR(s) from whitelist."
+        if skipped:
+            msg += f"\n\nSkipped: {len(skipped)}"
+        QMessageBox.information(self, "Whitelist", msg)
+
+    def add_vars_to_whitelist(self):
+        self._open_whitelist_dialog(initial_tab=0)
+
+    def remove_vars_from_whitelist(self):
+        self._open_whitelist_dialog(initial_tab=1)
+
 
     # ======================
     # One-time welcome
@@ -2544,6 +2920,32 @@ class MainWindow(QWidget):
         if self.cfg.get(key):
             return
         WelcomeDialog(self).exec()
+        self.cfg[key] = True
+        save_config(self.cfg)
+
+    def _one_time_cache_reset(self):
+        key = "one_time_cache_reset_v1_2"
+        if self.cfg.get(key):
+            return
+
+        # Remove caches (keep presets/config)
+        for p in (
+            cache_path(),
+            supporters_cache_path(),
+            app_data_dir() / "disable_failures.txt",
+        ):
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        try:
+            shutil.rmtree(app_data_dir() / "previews", ignore_errors=True)
+        except Exception:
+            pass
+
+        # Show welcome/support again
+        self.cfg.pop("welcome_shown_v1", None)
         self.cfg[key] = True
         save_config(self.cfg)
 
@@ -2864,17 +3266,22 @@ class MainWindow(QWidget):
 
     def _http_get_json(self, url: str, timeout: int = 10) -> dict:
         req = urllib.request.Request(url, headers={"User-Agent": f"VSVM/{APP_VERSION}"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_context()) as resp:
             data = resp.read().decode("utf-8", errors="ignore")
         return json.loads(data)
 
     def _download_file(self, url: str, dst: Path, timeout: int = 45):
         req = urllib.request.Request(url, headers={"User-Agent": f"VSVM/{APP_VERSION}"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_context()) as resp:
             dst.write_bytes(resp.read())
 
     def _current_exe_path(self) -> Path:
         return Path(sys.executable).resolve()
+
+    def _ssl_context(self) -> ssl.SSLContext:
+        if certifi:
+            return ssl.create_default_context(cafile=certifi.where())
+        return ssl.create_default_context()
 
     def _find_updater_exe(self) -> Path | None:
         p = self._current_exe_path().parent / UPDATER_EXE_NAME
@@ -3001,7 +3408,7 @@ class MainWindow(QWidget):
         if not addon.exists() or not addon.is_dir():
             return False, "AddonPackages folder not found inside this VaM directory."
 
-        var_count = len(list(addon.glob("*.var")))
+        var_count = len(fast_list_vars(addon))
         if var_count == 0:
             return False, "No .var files found in AddonPackages.\nMake sure this is the correct VaM folder."
 
@@ -3084,6 +3491,8 @@ class MainWindow(QWidget):
             self.vam_dir = target
             self.addon_dir = target / "AddonPackages"
             self.saves_scene_dir = target / "Saves" / "scene"
+            self.refresh_restore_button()
+            self.refresh_apply_button()
 
         self._refresh_in_progress = True
         self.refresh_refresh_button()
@@ -3097,7 +3506,7 @@ class MainWindow(QWidget):
                 self._update_scene_entries_looks()
                 self.total_scene_files_found = len(self.scene_entries)
                 try:
-                    self.total_vars_count = len(list(self.addon_dir.glob("*.var"))) if self.addon_dir else 0
+                    self.total_vars_count = len(fast_list_vars(self.addon_dir)) if self.addon_dir else 0
                 except Exception:
                     self.total_vars_count = 0
 
@@ -3151,7 +3560,7 @@ class MainWindow(QWidget):
             self.total_scene_files_found = len(self.scene_entries)
 
             try:
-                self.total_vars_count = len(list(self.addon_dir.glob("*.var"))) if self.addon_dir else 0
+                self.total_vars_count = len(fast_list_vars(self.addon_dir)) if self.addon_dir else 0
             except Exception:
                 self.total_vars_count = 0
 
@@ -3967,6 +4376,10 @@ class MainWindow(QWidget):
         if not enabled:
             self.scene_model.set_active_row(-1)
 
+        if enabled and not self._scene_select_glow_done_session:
+            self._scene_select_glow_done_session = True
+            self._stop_scene_select_glow()
+
         self.update_selection_ui()
 
 
@@ -4207,9 +4620,11 @@ class MainWindow(QWidget):
     def refresh_restore_button(self):
         if not self.vam_dir:
             self.btn_restore.setEnabled(False)
+            self.refresh_whitelist_buttons()
             return
         mp = manifest_path_for(self.vam_dir)
         self.btn_restore.setEnabled(mp.exists())
+        self.refresh_whitelist_buttons()
 
     def refresh_apply_button(self):
         """
@@ -4321,6 +4736,7 @@ class MainWindow(QWidget):
         protected |= {v for v in all_vars if "[plugin]" in v.lower()}
 
         keep = set(protected)
+        keep |= self.whitelist_var_names()
         queue: list[str] = []
 
         # Seed selected scene vars
@@ -4356,7 +4772,9 @@ class MainWindow(QWidget):
         renamed: list[dict] = []
         failed: list[str] = []
 
-        for orig_name, actual_path in fast_list_vars_all_states(addon_dir):
+        for orig_name, actual_path in fast_list_vars_all_states(addon_dir, exclude_dir_names={WHITELIST_DIR_NAME}):
+            if self._is_path_in_whitelist(actual_path):
+                continue
             if not actual_path.name.lower().endswith(".var"):
                 continue
             src = actual_path
@@ -4460,7 +4878,9 @@ class MainWindow(QWidget):
 
         # 2) Disable vars NOT in keep_set (only if currently enabled)
         disabled_by_tool = {item.get("from") for item in remaining if item.get("from")}
-        for orig, actual_path in fast_list_vars_all_states(addon_dir):
+        for orig, actual_path in fast_list_vars_all_states(addon_dir, exclude_dir_names={WHITELIST_DIR_NAME}):
+            if self._is_path_in_whitelist(actual_path):
+                continue
             if not actual_path.name.lower().endswith(".var"):
                 continue
             src = actual_path

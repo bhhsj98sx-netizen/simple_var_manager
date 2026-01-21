@@ -1,4 +1,7 @@
 ## Changelog
+### v1.2.1
+- Adding feature to whitelist .Var user dont want to disable
+- Rearranged UI layout
 
 ### v1.2.0
 - Make scanning and initial scanning way faster
