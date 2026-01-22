@@ -1,4 +1,8 @@
 ## Changelog
+
+### v1.2.2
+- Removed built-in updater; updates are now handled manually via official download links
+
 ### v1.2.1
 - Adding feature to whitelist .Var user dont want to disable
 - Rearranged UI layout

@@ -54,14 +54,14 @@ def resource_path(rel_path: str) -> Path:
 # ======================
 # App version + Updater (GitHub Releases)
 # ======================
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 GITHUB_OWNER = "bhhsj98sx-netizen"
 GITHUB_REPO = "simple_var_manager"
-GITHUB_LATEST_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+GITHUB_LATEST_API = f"https://api.github.com/repos/bhhsj98sx-netizen/simple_var_manager/releases/latest"
+GITHUB_README_URL = f"https://raw.githubusercontent.com/bhhsj98sx-netizen/simple_var_manager/main/readme.md"
 
-RELEASE_ASSET_NAME = "VaM.Simple.Var.Manager.exe"
-UPDATER_EXE_NAME = "updater.exe"
+PATREON_URL = "https://www.patreon.com/LQuest"
 
 
 # ======================
@@ -262,7 +262,7 @@ def load_supporters_cached(max_age_hours: float = 2.0) -> dict:
     try:
         req = urllib.request.Request(
             SUPPORTERS_URL,
-            headers={"User-Agent": f"VSVM/{APP_VERSION}"}
+            headers={"User-Agent": f"VSC/{APP_VERSION}"}
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = resp.read().decode("utf-8", errors="ignore")
@@ -594,10 +594,10 @@ class SceneDelegate(QStyledItemDelegate):
     def image_size(self) -> QSize:
         return QSize(self.img_w, self.img_h)
 
-    def sizeHint(self, option, index):  # type: ignore[override]
+    def sizeHint(self, option, index):  
         return QSize(self.card_w, self.card_h)
 
-    def paint(self, painter: QPainter, option, index):  # type: ignore[override]
+    def paint(self, painter: QPainter, option, index):  
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -1021,7 +1021,6 @@ class DonationDialog(QDialog):
 # Welcome popup (one-time)
 # ======================
 class WelcomeDialog(QDialog):
-    PATREON_URL = "https://www.patreon.com/c/LQuest"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1048,7 +1047,7 @@ class WelcomeDialog(QDialog):
         row.addStretch(1)
 
         btn = QPushButton("Open Patreon")
-        btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.PATREON_URL)))
+        btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(PATREON_URL)))
         row.addWidget(btn)
 
         close = QPushButton("Continue")
@@ -1057,6 +1056,35 @@ class WelcomeDialog(QDialog):
 
         layout.addLayout(row)
 
+
+# ======================
+# Update notes dialog
+# ======================
+class UpdateNotesDialog(QDialog):
+    def __init__(self, notes_text: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Update Notes")
+        self.resize(620, 520)
+
+        layout = QVBoxLayout(self)
+
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(False)
+        self.browser.setPlainText(notes_text)
+        layout.addWidget(self.browser, 1)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+
+        btn_dl = QPushButton("Go to download page")
+        btn_dl.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(PATREON_URL)))
+        row.addWidget(btn_dl)
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.accept)
+        row.addWidget(btn_close)
+
+        layout.addLayout(row)
 
 # ======================
 # Whitelist selection dialog
@@ -1234,8 +1262,8 @@ class AnalyzeWorker(QThread):
                     scenes_out.append({
                         "scene_name": scene_name,
                         "preview_relpath": "",
-                        "preview_inner": preview_inner, # IMPORTANT
-                        "scene_path": scene_inner,  # for looks detection
+                        "preview_inner": preview_inner, 
+                        "scene_path": scene_inner, 
                         "is_girl_looks": None,
                     })
 
@@ -1286,8 +1314,8 @@ class AnalyzeWorker(QThread):
                         "scene_name": s.get("scene_name", ""),
                         "var_name": name,
                         "preview_relpath": s.get("preview_relpath", ""),
-                        "preview_inner": s.get("preview_inner", ""),  # IMPORTANT
-                        "scene_path": s.get("scene_path", ""),  # for looks detection
+                        "preview_inner": s.get("preview_inner", ""),  
+                        "scene_path": s.get("scene_path", ""),  
                         "loose_relpath": "",
                         "is_girl_looks": None,
                     })
@@ -1301,7 +1329,6 @@ class AnalyzeWorker(QThread):
                 continue
             all_deps[name] = [d for d in deps if isinstance(d, str)]
 
-        # 6) Loose scenes (Saves/scene folder) - keep like before (this part is not heavy)
         if self.saves_scene_dir and self.saves_scene_dir.exists():
             for sp in self.saves_scene_dir.rglob("*.json"):
                 if (not show_hidden) and _is_hidden_sidecar(sp):
@@ -1325,7 +1352,7 @@ class AnalyzeWorker(QThread):
                         "scene_name": scene_name,
                         "var_name": "(Saves/scene)",
                         "preview_relpath": "",
-                        "preview_inner": "",  # IMPORTANT
+                        "preview_inner": "",  
                         "scene_path": "",
                         "loose_relpath": relp,
                         "is_girl_looks": None,
@@ -1339,7 +1366,7 @@ class AnalyzeWorker(QThread):
                     "scene_name": scene_name,
                     "var_name": "(Saves/scene)",
                     "preview_relpath": "",
-                    "preview_inner": "",  # IMPORTANT
+                    "preview_inner": "",  
                     "scene_path": "",
                     "loose_relpath": relp,
                     "is_girl_looks": None,
@@ -1348,7 +1375,7 @@ class AnalyzeWorker(QThread):
 
         # 7) Build cache object
         cache_obj = {
-            "version": 13,  # bump to 13 (scene_path added)
+            "version": 13,  
             "addon_dir": str(self.addon_dir),
             "vars": new_vars,
             "all_var_sigs": all_sigs,
@@ -1448,7 +1475,7 @@ class CacheSaveWorker(QThread):
 # PreviewLoader (background)
 # ======================
 class PreviewLoader(QThread):
-    result = Signal(object)  # dict with preview payload
+    result = Signal(object)  
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1826,15 +1853,15 @@ class DependencyRow(QWidget):
 # ======================
 def is_dark_mode(app: QApplication) -> bool:
     pal = app.palette()
-    # value 0-255, makin kecil makin gelap
+
     win = pal.color(QPalette.Window).value()
     txt = pal.color(QPalette.WindowText).value()
-    # kalau background gelap dan text terang -> dark mode
+  
     return win < 128 and txt > 128
 
 def build_btn_css(dark: bool) -> str:
     if not dark:
-        # LIGHT MODE → respect system palette, only sizing + disabled clarity
+        #light mode
         return """
         QPushButton, QComboBox {
             min-height: 26px;
@@ -1849,7 +1876,7 @@ def build_btn_css(dark: bool) -> str:
         }
         """
     else:
-        # DARK MODE → custom visual styling
+        #darkmode
         return """
         QPushButton, QComboBox {
             min-height: 26px;
@@ -2070,7 +2097,7 @@ class MainWindow(QWidget):
         self._one_time_cache_reset()
         _ = previews_dir()
 
-        self.setWindowTitle("VaM Scene Companion v1.2.1")
+        self.setWindowTitle("VaM Scene Companion v1.2.2")
         self.resize(1220, 780)
 
         self.vam_dir: Path | None = None
@@ -2136,7 +2163,7 @@ class MainWindow(QWidget):
         self._scene_select_glow_on = False
         self._scene_select_glow_done_session = False
 
-                # ---- selection dirty debounce (prevents UI freeze during batch/preset load)
+
         self._dirty_check_timer = QTimer(self)
         self._dirty_check_timer.setSingleShot(True)
         self._dirty_check_timer.setInterval(150)
@@ -2201,13 +2228,12 @@ class MainWindow(QWidget):
         self.btn_help.clicked.connect(self.open_help)
         row_head.addWidget(self.btn_help, 0, Qt.AlignRight)
 
-        # (You said you already moved Update beside Help earlier; keep it here.)
-        self.btn_check_update = QPushButton(" Update")
+        self.btn_check_update = QPushButton(" Check New Release")
         icon_path = resource_path("icons/update.png")
         if icon_path.exists():
             self.btn_check_update.setIcon(QIcon(str(icon_path)))
             self.btn_check_update.setIconSize(QSize(18, 18))
-        self.btn_check_update.setToolTip("Check GitHub for a newer version and update.")
+        self.btn_check_update.setToolTip("Show latest update notes from GitHub README.")
         self.btn_check_update.setStyleSheet(self._btn_css)
         self.btn_check_update.clicked.connect(self.check_update_clicked)
         row_head.addWidget(self.btn_check_update, 0, Qt.AlignRight)
@@ -2598,7 +2624,7 @@ class MainWindow(QWidget):
     #apply button styling
 
     def _schedule_check_selection_dirty(self):
-        # coalesce many rapid changes into 1 expensive check + possible QSS pulse update
+    
         if self._dirty_check_timer.isActive():
             return
         self._dirty_check_timer.start()
@@ -3059,12 +3085,10 @@ class MainWindow(QWidget):
         if obj == self.scene_view.viewport():
             et = event.type()
 
-            # keep your resize behavior
             if et == QEvent.Resize:
                 self._resize_timer.start()
                 return False
 
-            # --- drag-to-scroll (middle mouse) ---
             if et == QEvent.MouseButtonPress and event.button() == Qt.MiddleButton:
                 self._drag_scroll_active = True
                 self._drag_scroll_start_pos = event.globalPosition().toPoint()
@@ -3076,7 +3100,7 @@ class MainWindow(QWidget):
             if et == QEvent.MouseMove and self._drag_scroll_active:
                 cur = event.globalPosition().toPoint()
                 dy = cur.y() - self._drag_scroll_start_pos.y()
-                # invert so drag down scrolls down (natural touch feel)
+
                 self.scene_view.verticalScrollBar().setValue(self._drag_scroll_start_value - dy)
                 event.accept()
                 return True
@@ -3265,15 +3289,47 @@ class MainWindow(QWidget):
         return self._parse_version_tuple(latest) > self._parse_version_tuple(current)
 
     def _http_get_json(self, url: str, timeout: int = 10) -> dict:
-        req = urllib.request.Request(url, headers={"User-Agent": f"VSVM/{APP_VERSION}"})
+        req = urllib.request.Request(url, headers={"User-Agent": f"VSC/{APP_VERSION}"})
         with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_context()) as resp:
             data = resp.read().decode("utf-8", errors="ignore")
         return json.loads(data)
 
-    def _download_file(self, url: str, dst: Path, timeout: int = 45):
-        req = urllib.request.Request(url, headers={"User-Agent": f"VSVM/{APP_VERSION}"})
+    def _http_get_text(self, url: str, timeout: int = 10) -> str:
+        req = urllib.request.Request(url, headers={"User-Agent": f"VSC/{APP_VERSION}"})
         with urllib.request.urlopen(req, timeout=timeout, context=self._ssl_context()) as resp:
-            dst.write_bytes(resp.read())
+            return resp.read().decode("utf-8", errors="ignore")
+
+    def _extract_latest_update(self, readme_text: str) -> str:
+        lines = (readme_text or "").splitlines()
+        if not lines:
+            return ""
+
+        headings = [
+            "## changelog",
+            "## updates",
+            "## update",
+            "## what's new",
+            "## what’s new",
+            "## release notes",
+        ]
+        start = -1
+        for i, line in enumerate(lines):
+            if line.strip().lower() in headings:
+                start = i + 1
+                break
+
+        if start >= 0:
+            out: list[str] = []
+            for line in lines[start:]:
+                if line.strip().startswith("## "):
+                    break
+                out.append(line.rstrip())
+            text = "\n".join(out).strip()
+            if text:
+                return text
+
+        snippet = "\n".join(lines[:40]).strip()
+        return snippet
 
     def _current_exe_path(self) -> Path:
         return Path(sys.executable).resolve()
@@ -3283,10 +3339,6 @@ class MainWindow(QWidget):
             return ssl.create_default_context(cafile=certifi.where())
         return ssl.create_default_context()
 
-    def _find_updater_exe(self) -> Path | None:
-        p = self._current_exe_path().parent / UPDATER_EXE_NAME
-        return p if p.exists() else None
-
     def check_update_clicked(self):
         try:
             if self._startup_in_progress or self._refresh_in_progress:
@@ -3295,89 +3347,21 @@ class MainWindow(QWidget):
 
             self.loading.start("Checking Update", "Please wait...")
 
-            info = self._http_get_json(GITHUB_LATEST_API)
-            tag = str(info.get("tag_name") or "").strip()
-            if not tag:
-                self.loading.stop()
-                QMessageBox.warning(self, "Update", "Could not read latest release tag.")
-                return
-
-            latest_ver = tag.lstrip("vV")
-            if not self._is_newer(latest_ver, APP_VERSION):
-                self.loading.stop()
-                QMessageBox.information(
-                    self, "Update",
-                    f"You are up to date.\n\nCurrent: {APP_VERSION}\nLatest: {latest_ver}"
-                )
-                return
-
-            assets = info.get("assets", [])
-            dl_url = None
-            for a in assets:
-                if str(a.get("name")) == RELEASE_ASSET_NAME:
-                    dl_url = a.get("browser_download_url")
-                    break
-
+            readme_text = self._http_get_text(GITHUB_README_URL)
+            notes = self._extract_latest_update(readme_text)
             self.loading.stop()
 
-            if not dl_url:
-                QMessageBox.warning(
-                    self, "Update",
-                    f"New version found ({latest_ver}) but asset not found.\n\n"
-                    f"Expected asset name:\n{RELEASE_ASSET_NAME}"
-                )
+            if not notes:
+                QMessageBox.information(self, "Update", "Could not read update notes from README.")
                 return
 
-            reply = QMessageBox.question(
-                self, "Update Available",
-                f"New version is available!\n\nCurrent: {APP_VERSION}\nLatest: {latest_ver}\n\nInstall now?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-            self._download_and_install_update(latest_ver, dl_url)
+            dlg = UpdateNotesDialog(notes, self)
+            dlg.exec()
 
         except Exception as e:
             self.loading.stop()
             QMessageBox.warning(self, "Update", f"Update check failed:\n{e}")
 
-    def _download_and_install_update(self, latest_ver: str, dl_url: str):
-        updater = self._find_updater_exe()
-        if not updater:
-            QMessageBox.warning(
-                self, "Updater missing",
-                f"Update available ({latest_ver}) but {UPDATER_EXE_NAME} was not found.\n\n"
-                f"Place {UPDATER_EXE_NAME} next to:\n{self._current_exe_path().name}"
-            )
-            return
-
-        if not getattr(sys, "frozen", False):
-            QMessageBox.warning(
-                self, "Not supported",
-                "Update is only supported when running the built .exe.\n"
-                "Please run the packaged app and try again."
-            )
-            return
-
-        self.loading.start("Updating", "Downloading new version...")
-
-        try:
-            tmp_dir = Path(tempfile.gettempdir()) / "VSVM_updates"
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-
-            new_exe = tmp_dir / f"VSVM_{latest_ver}.exe"
-            self._download_file(dl_url, new_exe)
-
-            self.loading.stop()
-
-            current_exe = self._current_exe_path()
-            subprocess.Popen([str(updater), str(current_exe), str(new_exe)], cwd=str(updater.parent))
-            QApplication.quit()
-
-        except Exception as e:
-            self.loading.stop()
-            QMessageBox.critical(self, "Update failed", f"Failed to download/install:\n{e}")
 
     # ======================
     # Folder selection & validation
@@ -3631,8 +3615,8 @@ class MainWindow(QWidget):
                         "scene_name": s.get("scene_name", ""),
                         "var_name": var_name,
                         "preview_relpath": s.get("preview_relpath", ""),
-                        "preview_inner": s.get("preview_inner", ""),  # <-- WAJIB
-                        "scene_path": s.get("scene_path", ""),  # for looks detection
+                        "preview_inner": s.get("preview_inner", ""),  
+                        "scene_path": s.get("scene_path", ""),  
                         "loose_relpath": "",
                         "is_girl_looks": s.get("is_girl_looks", None),
                     })
@@ -4194,7 +4178,7 @@ class MainWindow(QWidget):
             if not fp.exists():
                 return False
             size = fp.stat().st_size
-            # treat large legacy previews as missing so we regenerate tiny thumbs
+
             return 0 < size <= 300_000
         except Exception:
             return False
@@ -4384,7 +4368,7 @@ class MainWindow(QWidget):
 
 
     def _check_selection_dirty(self):
-        # Only care while VaM is running OR lean session is active
+   
         if not (self.is_vam_running() or self.lean_active):
             self.selection_dirty = False
             self.set_apply_attention(False)
@@ -4402,7 +4386,7 @@ class MainWindow(QWidget):
         if self._syncing_selection_ui:
             return
 
-        # short-circuit if nothing changes (saves tons of work)
+
         already = (var_name in self.selected_scene_vars)
         if selected == already:
             return
@@ -4418,7 +4402,7 @@ class MainWindow(QWidget):
         finally:
             self._syncing_selection_ui = False
 
-        # IMPORTANT: during batch, don't rebuild grid / update labels / style every click
+
         if self._batch_selection:
             return
 
@@ -4504,8 +4488,8 @@ class MainWindow(QWidget):
         self.scene_model.set_active_row(row)
         self.show_loose_scene_info(item)
 
-    def closeEvent(self, event):  # type: ignore[override]
-        # Ensure background threads are stopped before exit.
+    def closeEvent(self, event):  
+     
         try:
             self._stop_all_preview_loaders()
         except Exception:
@@ -4561,7 +4545,7 @@ class MainWindow(QWidget):
 
         var_path = self.get_var_existing_path(var_name)
         if not var_path:
-            # file bisa saja hilang benar-benar (user delete manual), jangan crash
+    
             self.dep_summary.setText("VAR file not found on disk (enabled/disabled).")
             while self.dep_list_layout.count():
                 item = self.dep_list_layout.takeAt(0)
@@ -4575,8 +4559,6 @@ class MainWindow(QWidget):
         info = scan_var_meta_only(var_path)
         deps = sorted(info.get("dependencies", []))
 
-
-        # IMPORTANT: all vars should include disabled too
         all_vars = set(self.list_var_state_map().keys())
 
         while self.dep_list_layout.count():
@@ -4600,7 +4582,7 @@ class MainWindow(QWidget):
             if present:
                 present_count += 1
                 chosen = sorted(matched)[-1]
-                # show if chosen currently disabled or enabled
+
                 state = self.list_var_state_map().get(chosen, "")
                 suffix = " (disabled)" if state == "disabled" else ""
                 text = f"{dep}  →  {chosen}{suffix}"
@@ -4728,7 +4710,7 @@ class MainWindow(QWidget):
     def compute_keep_set_for_scene_vars(self, scene_vars: set[str]) -> set[str]:
         assert self.addon_dir is not None
 
-        # ✅ IMPORTANT: dependency universe must be ALL vars on disk (enabled + disabled)
+      
         all_vars = self.all_var_names_on_disk()
 
         # Protect assets/plugins by name (same behavior as before, but now sees everything)
@@ -4813,8 +4795,7 @@ class MainWindow(QWidget):
                 QMessageBox.warning(
                     self,
                     "Some VARs could not be disabled",
-                    f"{len(failed)} VAR files could not be renamed.\n\n"
-                    f"See: {log_path}"
+                    f"{len(failed)} VAR files could not be renamed."
                 )
             except Exception:
                 pass
@@ -4927,8 +4908,7 @@ class MainWindow(QWidget):
                 QMessageBox.warning(
                     self,
                     "Some VARs could not be disabled",
-                    f"{len(failed)} VAR files could not be renamed.\n\n"
-                    f"See: {log_path}"
+                    f"{len(failed)} VAR files could not be renamed."
                 )
             except Exception:
                 pass
